@@ -9,7 +9,7 @@ use bollard::query_parameters::{ListContainersOptionsBuilder, InspectContainerOp
 /// 
 /// ## Minimal validation (default)
 /// ```rust
-/// use crate::server::config::DockerValidationOptions;
+/// use sops_secrets::server::config::DockerValidationOptions;
 /// 
 /// let options = DockerValidationOptions::default();
 /// // Only validates network membership
@@ -17,7 +17,7 @@ use bollard::query_parameters::{ListContainersOptionsBuilder, InspectContainerOp
 /// 
 /// ## Moderate validation
 /// ```rust
-/// use crate::server::config::DockerValidationOptions;
+/// use sops_secrets::server::config::DockerValidationOptions;
 /// 
 /// let options = DockerValidationOptions::moderate();
 /// // Validates container state and network membership
@@ -25,7 +25,7 @@ use bollard::query_parameters::{ListContainersOptionsBuilder, InspectContainerOp
 /// 
 /// ## Strict validation
 /// ```rust
-/// use crate::server::config::DockerValidationOptions;
+/// use sops_secrets::server::config::DockerValidationOptions;
 /// 
 /// let options = DockerValidationOptions::strict();
 /// // Validates all checks (requires labels and registries to be configured)
@@ -33,7 +33,7 @@ use bollard::query_parameters::{ListContainersOptionsBuilder, InspectContainerOp
 /// 
 /// ## Custom validation with labels
 /// ```rust
-/// use crate::server::config::DockerValidationOptions;
+/// use sops_secrets::server::config::DockerValidationOptions;
 /// 
 /// let options = DockerValidationOptions::default()
 ///     .with_container_state_validation()
@@ -45,7 +45,7 @@ use bollard::query_parameters::{ListContainersOptionsBuilder, InspectContainerOp
 /// 
 /// ## Custom validation with registry restrictions
 /// ```rust
-/// use crate::server::config::DockerValidationOptions;
+/// use sops_secrets::server::config::DockerValidationOptions;
 /// 
 /// let options = DockerValidationOptions::default()
 ///     .with_registry_validation(vec![

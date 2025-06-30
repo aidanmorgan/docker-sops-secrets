@@ -7,40 +7,41 @@ use crate::server::models::HealthChecks;
 
 /// Perform comprehensive health checks on the server
 pub async fn perform_health_checks(state: &AppState) -> HealthChecks {
-    let sops_wrapper = check_sops_wrapper(state).await;
-    let master_key = check_master_key_path(&state.server_config).await;
-    let docker_api = check_docker_api(state).await;
+    let sops_executable = check_sops_wrapper(state).await;
     let age_executable = check_age_executable(&state.server_config).await;
     let secrets_directory = check_secrets_directory(&state.server_config).await;
+    let docker_api = check_docker_api(state).await;
+    let sops_file = check_sops_file_path(&state.server_config).await;
+    let master_key = check_master_key_path(&state.server_config).await;
 
     HealthChecks {
-        sops_wrapper,
+        sops_wrapper: sops_executable,
         master_key,
         docker_api,
         age_executable,
         secrets_directory,
+        sops_file,
     }
 }
 
-/// Check if SOPS wrapper is working
+/// Check if SOPS executable is available
 async fn check_sops_wrapper(state: &AppState) -> bool {
-    match state.sops_client.get_secret_data("test", None).await {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    state.sops_client.validate_sops(None).await.is_ok()
+}
+
+/// Check if SOPS file exists
+async fn check_sops_file_path(config: &ServerConfig) -> bool {
+    std::path::Path::new(&config.sops_file_path).exists()
 }
 
 /// Check if master key file exists and is readable
 async fn check_master_key_path(config: &ServerConfig) -> bool {
-    Path::new(&config.master_key_path).exists()
+    std::path::Path::new(&config.master_key_path).exists()
 }
 
 /// Check if Docker API is accessible
 async fn check_docker_api(state: &AppState) -> bool {
-    match state.docker_client.ping().await {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    state.docker_client.ping().await.is_ok()
 }
 
 /// Check if age executable is available

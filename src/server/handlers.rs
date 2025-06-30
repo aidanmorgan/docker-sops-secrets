@@ -33,11 +33,12 @@ pub async fn health_check(
             docker_api: false,
             age_executable: false,
             secrets_directory: false,
+            sops_file: false,
         });
 
-    let status = checks.sops_wrapper && checks.master_key && checks.docker_api && checks.age_executable && checks.secrets_directory;
+    // Only fail if one of the critical checks is false
+    let status = checks.sops_wrapper && checks.age_executable && checks.docker_api && checks.secrets_directory;
     let timestamp = chrono::Utc::now().to_rfc3339();
-
     (
         if status { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR },
             Json(HealthResponse {

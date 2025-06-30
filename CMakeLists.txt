@@ -9,6 +9,7 @@ option(BUILD_SERVER_IMAGE "Build server Docker image" ON)
 option(BUILD_CLI_IMAGE "Build CLI Docker image" ON)
 option(BUILD_EXPORTER_IMAGE "Build exporter Docker image" ON)
 option(BUILD_ALL_IMAGES "Build all Docker images" ON)
+option(RUN_INTEGRATION_TESTS "Run integration tests" ON)
 
 # Docker configuration
 set(DOCKER_REGISTRY "" CACHE STRING "Docker registry (optional)")
@@ -17,11 +18,22 @@ set(DOCKER_TAG "latest" CACHE STRING "Docker image tag")
 set(DOCKER_BUILD_CONTEXT "." CACHE STRING "Docker build context")
 set(DOCKER_SERVER_PORT "3000" CACHE STRING "Server port for Docker containers")
 
+# Integration test configuration
+set(INTEGRATION_TEST_DIR "${CMAKE_SOURCE_DIR}/tests/integration" CACHE STRING "Integration test directory")
+set(INTEGRATION_TEST_RESULTS_DIR "${CMAKE_BINARY_DIR}/test-results" CACHE STRING "Integration test results directory")
+set(INTEGRATION_TEST_TIMEOUT "600" CACHE STRING "Integration test timeout in seconds")
+
 # SOPS configuration
 set(SOPS_VERSION "v3.10.2" CACHE STRING "SOPS version to install")
 
+# Age configuration
+set(AGE_VERSION "v1.2.1" CACHE STRING "Age version to install")
+
+# Architecture configuration
+set(ARCH "amd64" CACHE STRING "CPU architecture for binary downloads (amd64, arm64, etc.)")
+
 # Rust configuration
-set(RUST_VERSION "1.75" CACHE STRING "Rust version for building")
+set(RUST_VERSION "1.76" CACHE STRING "Rust version for building")
 set(RUST_TARGET "release" CACHE STRING "Rust build target")
 
 # Build directories
@@ -30,6 +42,7 @@ set(DOCKER_BUILD_DIR "${BUILD_DIR}/docker")
 
 # Create build directories
 file(MAKE_DIRECTORY ${DOCKER_BUILD_DIR})
+file(MAKE_DIRECTORY ${INTEGRATION_TEST_RESULTS_DIR})
 
 # Function to create Docker build target for server (runnable service)
 function(create_server_target target_name dockerfile service_type)
@@ -51,6 +64,8 @@ function(create_server_target target_name dockerfile service_type)
             --tag ${image_name}
             --target runtime
             --build-arg SOPS_VERSION=${SOPS_VERSION}
+            --build-arg AGE_VERSION=${AGE_VERSION}
+            --build-arg ARCH=${ARCH}
             --build-arg RUST_VERSION=${RUST_VERSION}
             --build-arg RUST_TARGET=${RUST_TARGET}
             --build-arg SERVER_PORT=${DOCKER_SERVER_PORT}
@@ -146,6 +161,7 @@ function(create_binary_target target_name dockerfile service_type)
             --tag ${image_name}
             --target runtime
             --build-arg SOPS_VERSION=${SOPS_VERSION}
+            --build-arg ARCH=${ARCH}
             --build-arg RUST_VERSION=${RUST_VERSION}
             --build-arg RUST_TARGET=${RUST_TARGET}
             --progress=plain
@@ -298,6 +314,107 @@ if(DOCKER_COMPOSE_EXECUTABLE)
     create_compose_target(docker-compose-ps ps)
 endif()
 
+# Integration test targets
+if(RUN_INTEGRATION_TESTS AND DOCKER_EXECUTABLE AND DOCKER_COMPOSE_EXECUTABLE)
+    # Build test images with test tags
+    add_custom_target(docker-build-test-images
+        COMMAND ${CMAKE_COMMAND} -E echo "Building test images for integration tests..."
+        COMMAND docker build --file Dockerfile.server --tag sops-secrets-server:test --target runtime --build-arg SOPS_VERSION=${SOPS_VERSION} --build-arg AGE_VERSION=${AGE_VERSION} --build-arg ARCH=${ARCH} --build-arg RUST_VERSION=${RUST_VERSION} --build-arg RUST_TARGET=${RUST_TARGET} --build-arg SERVER_PORT=${DOCKER_SERVER_PORT} .
+        COMMAND docker build --file Dockerfile.cli --tag sops-secrets-cli:test --target runtime --build-arg SOPS_VERSION=${SOPS_VERSION} --build-arg ARCH=${ARCH} --build-arg RUST_VERSION=${RUST_VERSION} --build-arg RUST_TARGET=${RUST_TARGET} .
+        COMMAND docker build --file Dockerfile.exporter --tag sops-secrets-exporter:test --target runtime --build-arg SOPS_VERSION=${SOPS_VERSION} --build-arg ARCH=${ARCH} --build-arg RUST_VERSION=${RUST_VERSION} --build-arg RUST_TARGET=${RUST_TARGET} .
+        COMMAND docker build --file ${INTEGRATION_TEST_DIR}/Dockerfile.test-runner --tag sops-secrets-test-runner:latest --build-arg SOPS_VERSION=${SOPS_VERSION} --build-arg AGE_VERSION=${AGE_VERSION} --build-arg ARCH=${ARCH} ${INTEGRATION_TEST_DIR}
+        COMMAND ${CMAKE_COMMAND} -E echo "Test images built successfully"
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Building test images for integration tests"
+        VERBATIM
+    )
+    
+    # Run integration tests
+    add_custom_target(integration-tests
+        COMMAND ${CMAKE_COMMAND} -E echo "🚀 Starting integration tests..."
+        COMMAND ${CMAKE_COMMAND} -E echo "📁 Test results will be saved to: ${INTEGRATION_TEST_RESULTS_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${INTEGRATION_TEST_RESULTS_DIR}
+        COMMAND ${CMAKE_COMMAND} -E echo "🧹 Cleaning up any existing test resources..."
+        COMMAND docker-compose -f ${INTEGRATION_TEST_DIR}/docker-compose.test.yml down -v --remove-orphans || true
+        COMMAND docker network rm sops-test-net || true
+        COMMAND docker volume rm sops-secrets-test-data || true
+        COMMAND ${CMAKE_COMMAND} -E echo "🐳 Starting test environment..."
+        COMMAND docker-compose -f ${INTEGRATION_TEST_DIR}/docker-compose.test.yml up -d
+        COMMAND ${CMAKE_COMMAND} -E echo "⏳ Waiting for services to be ready..."
+        COMMAND sleep 30
+        COMMAND ${CMAKE_COMMAND} -E echo "🧪 Running test runner..."
+        COMMAND timeout ${INTEGRATION_TEST_TIMEOUT} docker-compose -f ${INTEGRATION_TEST_DIR}/docker-compose.test.yml run --rm test-runner
+        COMMAND ${CMAKE_COMMAND} -E echo "📋 Copying test results..."
+        COMMAND docker cp test-runner:/tmp/integration_test_report.json ${INTEGRATION_TEST_RESULTS_DIR}/integration_test_report.json || ${CMAKE_COMMAND} -E echo "No test report found"
+        COMMAND ${CMAKE_COMMAND} -E echo "📄 Test results copied to: ${INTEGRATION_TEST_RESULTS_DIR}/integration_test_report.json"
+        COMMAND ${CMAKE_COMMAND} -E echo "🧹 Cleaning up test environment..."
+        COMMAND docker-compose -f ${INTEGRATION_TEST_DIR}/docker-compose.test.yml down -v
+        COMMAND ${CMAKE_COMMAND} -E echo "✅ Integration tests completed"
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Running integration tests"
+        VERBATIM
+    )
+    
+    # Run integration tests with detailed output
+    add_custom_target(integration-tests-verbose
+        COMMAND ${CMAKE_COMMAND} -E echo "🚀 Starting integration tests (verbose mode)..."
+        COMMAND ${CMAKE_COMMAND} -E echo "📁 Test results will be saved to: ${INTEGRATION_TEST_RESULTS_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${INTEGRATION_TEST_RESULTS_DIR}
+        COMMAND ${CMAKE_COMMAND} -E echo "🧹 Cleaning up any existing test resources..."
+        COMMAND docker-compose -f ${INTEGRATION_TEST_DIR}/docker-compose.test.yml down -v --remove-orphans || true
+        COMMAND docker network rm sops-test-net || true
+        COMMAND docker volume rm sops-secrets-test-data || true
+        COMMAND ${CMAKE_COMMAND} -E echo "🐳 Starting test environment..."
+        COMMAND docker-compose -f ${INTEGRATION_TEST_DIR}/docker-compose.test.yml up -d
+        COMMAND ${CMAKE_COMMAND} -E echo "⏳ Waiting for services to be ready..."
+        COMMAND sleep 30
+        COMMAND ${CMAKE_COMMAND} -E echo "🧪 Running test runner with detailed output..."
+        COMMAND timeout ${INTEGRATION_TEST_TIMEOUT} docker-compose -f ${INTEGRATION_TEST_DIR}/docker-compose.test.yml run --rm test-runner 2>&1 | tee ${INTEGRATION_TEST_RESULTS_DIR}/test_output.log
+        COMMAND ${CMAKE_COMMAND} -E echo "📋 Copying test results..."
+        COMMAND docker cp test-runner:/tmp/integration_test_report.json ${INTEGRATION_TEST_RESULTS_DIR}/integration_test_report.json || ${CMAKE_COMMAND} -E echo "No test report found"
+        COMMAND ${CMAKE_COMMAND} -E echo "📄 Test results copied to: ${INTEGRATION_TEST_RESULTS_DIR}/integration_test_report.json"
+        COMMAND ${CMAKE_COMMAND} -E echo "📄 Test output saved to: ${INTEGRATION_TEST_RESULTS_DIR}/test_output.log"
+        COMMAND ${CMAKE_COMMAND} -E echo "🧹 Cleaning up test environment..."
+        COMMAND docker-compose -f ${INTEGRATION_TEST_DIR}/docker-compose.test.yml down -v
+        COMMAND ${CMAKE_COMMAND} -E echo "✅ Integration tests completed"
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Running integration tests with detailed output"
+        VERBATIM
+    )
+    
+    # Clean integration test environment
+    add_custom_target(integration-tests-clean
+        COMMAND ${CMAKE_COMMAND} -E echo "🧹 Cleaning integration test environment..."
+        COMMAND docker-compose -f ${INTEGRATION_TEST_DIR}/docker-compose.test.yml down -v --remove-orphans
+        COMMAND docker rmi sops-secrets-server:test sops-secrets-cli:test sops-secrets-exporter:test sops-secrets-test-runner:latest || true
+        COMMAND docker network rm sops-test-net || true
+        COMMAND docker volume rm sops-secrets-test-data || true
+        COMMAND ${CMAKE_COMMAND} -E echo "✅ Integration test environment cleaned"
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Cleaning integration test environment"
+        VERBATIM
+    )
+    
+    # Show integration test results
+    add_custom_target(integration-tests-results
+        COMMAND ${CMAKE_COMMAND} -E echo "📊 Integration Test Results"
+        COMMAND ${CMAKE_COMMAND} -E echo "=========================="
+        COMMAND ${CMAKE_COMMAND} -E echo "Results directory: ${INTEGRATION_TEST_RESULTS_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E ls -la ${INTEGRATION_TEST_RESULTS_DIR} || ${CMAKE_COMMAND} -E echo "No test results found"
+        COMMAND ${CMAKE_COMMAND} -E echo ""
+        COMMAND ${CMAKE_COMMAND} -E echo "📄 Test Report (if available):"
+        COMMAND cat ${INTEGRATION_TEST_RESULTS_DIR}/integration_test_report.json || ${CMAKE_COMMAND} -E echo "No test report found"
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Showing integration test results"
+        VERBATIM
+    )
+    
+    # Set dependencies
+    add_dependencies(integration-tests docker-build-test-images)
+    add_dependencies(integration-tests-verbose docker-build-test-images)
+    add_dependencies(integration-tests-results integration-tests)
+endif()
+
 # Create utility targets
 add_custom_target(docker-clean-all
     COMMAND ${CMAKE_COMMAND} -E echo "Cleaning all Docker resources..."
@@ -318,11 +435,15 @@ add_custom_target(docker-info
     COMMAND ${CMAKE_COMMAND} -E echo "  Tag: ${DOCKER_TAG}"
     COMMAND ${CMAKE_COMMAND} -E echo "  Server port: ${DOCKER_SERVER_PORT}"
     COMMAND ${CMAKE_COMMAND} -E echo "  SOPS version: ${SOPS_VERSION}"
+    COMMAND ${CMAKE_COMMAND} -E echo "  Age version: ${AGE_VERSION}"
+    COMMAND ${CMAKE_COMMAND} -E echo "  Architecture: ${ARCH}"
     COMMAND ${CMAKE_COMMAND} -E echo "  Rust version: ${RUST_VERSION}"
     COMMAND ${CMAKE_COMMAND} -E echo "  Build targets:"
     COMMAND ${CMAKE_COMMAND} -E echo "    Server: ${BUILD_SERVER_IMAGE}"
     COMMAND ${CMAKE_COMMAND} -E echo "    CLI: ${BUILD_CLI_IMAGE}"
     COMMAND ${CMAKE_COMMAND} -E echo "    Exporter: ${BUILD_EXPORTER_IMAGE}"
+    COMMAND ${CMAKE_COMMAND} -E echo "  Integration tests: ${RUN_INTEGRATION_TESTS}"
+    COMMAND ${CMAKE_COMMAND} -E echo "  Test results directory: ${INTEGRATION_TEST_RESULTS_DIR}"
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Showing Docker configuration"
     VERBATIM
@@ -335,11 +456,15 @@ message(STATUS "  Image prefix: ${DOCKER_IMAGE_PREFIX}")
 message(STATUS "  Tag: ${DOCKER_TAG}")
 message(STATUS "  Server port: ${DOCKER_SERVER_PORT}")
 message(STATUS "  SOPS version: ${SOPS_VERSION}")
+message(STATUS "  Age version: ${AGE_VERSION}")
+message(STATUS "  Architecture: ${ARCH}")
 message(STATUS "  Rust version: ${RUST_VERSION}")
 message(STATUS "  Build targets:")
 message(STATUS "    Server: ${BUILD_SERVER_IMAGE}")
 message(STATUS "    CLI: ${BUILD_CLI_IMAGE}")
 message(STATUS "    Exporter: ${BUILD_EXPORTER_IMAGE}")
+message(STATUS "  Integration tests: ${RUN_INTEGRATION_TESTS}")
+message(STATUS "  Test results directory: ${INTEGRATION_TEST_RESULTS_DIR}")
 
 # Available targets summary
 message(STATUS "")
@@ -354,4 +479,14 @@ message(STATUS "  docker-server-scan     - Scan server image")
 message(STATUS "  docker-compose-up      - Start services")
 message(STATUS "  docker-compose-down    - Stop services")
 message(STATUS "  docker-clean-all       - Clean all Docker resources")
-message(STATUS "  docker-info            - Show configuration") 
+message(STATUS "  docker-info            - Show configuration")
+
+if(RUN_INTEGRATION_TESTS)
+    message(STATUS "")
+    message(STATUS "Available Integration Test targets:")
+    message(STATUS "  docker-build-test-images    - Build test images")
+    message(STATUS "  integration-tests           - Run integration tests")
+    message(STATUS "  integration-tests-verbose   - Run integration tests with detailed output")
+    message(STATUS "  integration-tests-clean     - Clean test environment")
+    message(STATUS "  integration-tests-results   - Show test results")
+endif() 
