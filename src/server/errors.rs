@@ -4,7 +4,7 @@ use axum::{
     Json,
 };
 use crate::server::ErrorResponse;
-use crate::shared::SopsError;
+use crate::shared::sops::SopsError;
 
 /// Custom error type for server operations
 #[derive(Debug, thiserror::Error)]

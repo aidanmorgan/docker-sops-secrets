@@ -3,6 +3,9 @@ name = "sops-secrets"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test_logging = []
+
 [[bin]]
 name = "sops-secrets-server"
 path = "src/bin/server.rs"

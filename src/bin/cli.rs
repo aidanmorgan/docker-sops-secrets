@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use sops_secrets::shared::{SopsWrapper, SopsConfig, SopsResult};
+use sops_secrets::shared::sops::{SopsWrapper, SopsConfig, SopsResult, SopsError};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -222,7 +222,7 @@ async fn handle_commands(sops: &SopsWrapper, command: &Commands) -> SopsResult<(
                 if let Some((key, value)) = secret_pair.split_once('=') {
                     secrets_map.insert(key.to_string(), value.to_string());
                 } else {
-                    return Err(sops_secrets::shared::SopsError::InvalidSecretFormat(
+                    return Err(SopsError::InvalidSecretFormat(
                         format!("Invalid secret format: {}", secret_pair)
                     ));
                 }

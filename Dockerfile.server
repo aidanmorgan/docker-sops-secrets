@@ -5,6 +5,7 @@ FROM rust:bookworm as deps
 # Build arguments
 ARG RUST_VERSION=1.76
 ARG RUST_TARGET=release
+ARG ENABLE_TEST_LOGGING=false
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -18,42 +19,29 @@ RUN apt-get update && apt-get install -y \
 # Create non-root user for building
 RUN groupadd -r rustuser && useradd -r -g rustuser rustuser
 
+
 # Set working directory
 WORKDIR /app
 
 # Copy Cargo files first for better layer caching
 COPY Cargo.toml Cargo.lock ./
 
-# Create dummy source files to build dependencies
-RUN mkdir -p src/bin src/shared src/server src/client && \
-    echo "pub mod shared;" > src/lib.rs && \
-    echo "fn main() {}" > src/bin/server.rs && \
-    echo "pub mod age;" > src/shared/mod.rs && \
-    echo "pub struct AgeError;" > src/shared/age.rs && \
-    echo "pub mod docker;" > src/server/mod.rs && \
-    echo "pub struct DockerError;" > src/server/docker.rs && \
-    echo "pub mod config;" > src/server/mod.rs && \
-    echo "pub struct Config;" > src/server/config.rs && \
-    echo "pub mod errors;" > src/server/errors.rs && \
-    echo "pub struct Error;" > src/server/errors.rs && \
-    echo "pub mod mod;" > src/client/mod.rs && \
-    echo "fn main() {}" > src/bin/cli.rs && \
-    echo "fn main() {}" > src/bin/exporter.rs
-
 # Build dependencies only (this layer will be cached)
-RUN cargo build --release --bin sops-secrets-server
+RUN mkdir -p src && touch src/lib.rs
+RUN cargo fetch
 
 # Stage 2: Build stage with actual source code
 FROM deps as builder
-
-# Remove dummy source files
-RUN rm -rf src/
 
 # Copy actual source code
 COPY src/ ./src/
 
 # Build the actual server binary
-RUN cargo build --release --bin sops-secrets-server
+RUN if [ "$ENABLE_TEST_LOGGING" = "true" ]; then \
+        cargo build --release --bin sops-secrets-server --features test_logging; \
+    else \
+        cargo build --release --bin sops-secrets-server; \
+    fi
 
 # Stage 3: SOPS installation and validation
 FROM debian:bookworm-slim AS sops-installer
@@ -115,7 +103,8 @@ ARG SERVER_PORT=3000
 
 # Install curl for health checks and create non-root user
 RUN apt-get update && apt-get install -y curl ca-certificates && rm -rf /var/lib/apt/lists/* && \
-    groupadd -r appuser && useradd -r -g appuser appuser
+    groupadd -r appuser && useradd -r -g appuser appuser && \
+    groupadd -r docker && usermod -a -G docker appuser
 
 # Copy SOPS from installer stage
 COPY --from=sops-installer /usr/local/bin/sops /usr/local/bin/sops
@@ -147,5 +136,7 @@ ENV SOPS_SERVER_URL=http://localhost:${SERVER_PORT} \
 # Expose server port (configurable via SERVER_PORT env var)
 EXPOSE ${SERVER_PORT}
 
-# Default command
-CMD ["/usr/local/bin/sops-secrets-server"] 
+# Add entrypoint script
+COPY --chmod=+x docker/entrypoint-server.sh /entrypoint-server.sh
+
+ENTRYPOINT ["/entrypoint-server.sh"] 

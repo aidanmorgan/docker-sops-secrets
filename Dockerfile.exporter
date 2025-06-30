@@ -14,30 +14,13 @@ WORKDIR /app
 # Copy Cargo files
 COPY Cargo.toml Cargo.lock ./
 
-# Create dummy source files to cache dependencies
-RUN mkdir -p src/bin src/shared src/server src/client && \
-    echo "fn main() {}" > src/bin/exporter.rs && \
-    echo "pub mod shared;" > src/lib.rs && \
-    echo "pub mod age;" > src/shared/mod.rs && \
-    echo "pub struct AgeError;" > src/shared/age.rs && \
-    echo "pub mod config;" > src/server/mod.rs && \
-    echo "pub struct Config;" > src/server/config.rs && \
-    echo "pub mod docker;" > src/server/docker.rs && \
-    echo "pub struct DockerError;" > src/server/docker.rs && \
-    echo "pub mod errors;" > src/server/errors.rs && \
-    echo "pub struct Error;" > src/server/errors.rs && \
-    echo "pub mod mod;" > src/client/mod.rs && \
-    echo "fn main() {}" > src/bin/server.rs && \
-    echo "fn main() {}" > src/bin/cli.rs
-
 # Build dependencies only
-RUN cargo build --release --bin sops-secrets-exporter
+RUN mkdir -p src && touch src/lib.rs
+RUN cargo fetch
 
 # Stage 2: Build stage with actual source code
 FROM deps as builder
 
-# Remove dummy files and copy real source
-RUN rm -rf src/
 COPY src/ ./src/
 
 # Build the actual exporter binary

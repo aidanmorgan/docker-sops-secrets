@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use bollard::Docker;
 
-use crate::shared::SopsWrapper;
+use crate::shared::sops::SopsWrapper;
 use crate::server::config::ServerConfig;
 use crate::server::docker::ContainerCache;
 use crate::server::file_cleaner::FileCleanupManager;

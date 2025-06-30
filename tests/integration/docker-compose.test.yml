@@ -1,0 +1,168 @@
+version: '3.8'
+
+services:
+  # Test server with comprehensive configuration
+  sops-secrets-server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.server
+      target: runtime
+      args:
+        RUST_TARGET: "release"
+        SERVER_PORT: "3000"
+        ENABLE_TEST_LOGGING: "true"
+    image: sops-secrets-server:test
+    container_name: sops-secrets-server-test
+    command: [
+      "sops-secrets-server",
+      "--port", "3000",
+      "--sops-file-path", "/run/secrets/secrets.yaml",
+      "--master-key-path", "/run/secrets/master_key.age",
+      "--docker-network-name", "sops-test-net",
+      "--secrets-dir", "/var/tmp/sops-secrets",
+      "--docker-validation-level", "severe",
+      "--docker-trusted-registries", "test-registry.com,localhost",
+      "--docker-required-labels", "security=high,environment=test"
+    ]
+    ports:
+      - "3000:3000"
+    environment:
+      - RUST_LOG=debug
+      - SERVER_PORT=3000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - sops-secrets-test-data:/var/tmp/sops-secrets:rw
+      - sops-secrets-test-data:/run/secrets:rw
+    networks:
+      - sops-secrets-test-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    labels:
+      - "security=high"
+      - "environment=test"
+      - "component=sops-secrets"
+
+  # Authorized test client with proper labels
+  authorized-client:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cli
+      target: runtime
+    image: sops-secrets-cli:test
+    container_name: authorized-client-test
+    command: ["sleep", "infinity"]
+    networks:
+      - sops-secrets-test-network
+    depends_on:
+      sops-secrets-server:
+        condition: service_healthy
+    labels:
+      - "security=high"
+      - "environment=test"
+      - "component=test-client"
+
+  # Unauthorized test client (missing required labels)
+  unauthorized-client:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cli
+      target: runtime
+    image: sops-secrets-cli:test
+    container_name: unauthorized-client-test
+    command: ["sleep", "infinity"]
+    networks:
+      - sops-secrets-test-network
+    depends_on:
+      sops-secrets-server:
+        condition: service_healthy
+    labels:
+      - "environment=test"
+      # Missing security=high label
+
+  # Test client from untrusted registry
+  untrusted-client:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cli
+      target: runtime
+    image: untrusted-registry.com/sops-secrets-cli:test
+    container_name: untrusted-client-test
+    command: ["sleep", "infinity"]
+    networks:
+      - sops-secrets-test-network
+    depends_on:
+      sops-secrets-server:
+        condition: service_healthy
+    labels:
+      - "security=high"
+      - "environment=test"
+
+  # Exporter test client
+  exporter-client:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.exporter
+      target: runtime
+    image: sops-secrets-exporter:test
+    container_name: exporter-client-test
+    command: ["sleep", "infinity"]
+    networks:
+      - sops-secrets-test-network
+    depends_on:
+      sops-secrets-server:
+        condition: service_healthy
+    labels:
+      - "security=high"
+      - "environment=test"
+      - "component=exporter"
+
+  # Test runner that executes all integration tests
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test-runner
+    image: sops-secrets-test-runner:latest
+    container_name: test-runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - sops-secrets-test-data:/run/secrets
+    networks:
+      - sops-secrets-test-network
+    depends_on:
+      sops-secrets-server:
+        condition: service_healthy
+      authorized-client:
+        condition: service_started
+      unauthorized-client:
+        condition: service_started
+      untrusted-client:
+        condition: service_started
+      exporter-client:
+        condition: service_started
+    environment:
+      - SOPS_SERVER_URL=http://sops-secrets-server:3000
+      - MASTER_KEY_PATH=/run/secrets/master_key.age
+      - SOPS_FILE_PATH=/run/secrets/secrets.yaml
+    labels:
+      - "security=high"
+      - "environment=test"
+      - "component=test-runner"
+
+networks:
+  sops-secrets-test-network:
+    driver: bridge
+    name: sops-test-net
+
+volumes:
+  sops-secrets-test-data:
+    driver: local
+    name: sops-secrets-test-data
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=100m,noexec,nosuid,nodev 
