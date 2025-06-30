@@ -102,9 +102,12 @@ FROM debian:bookworm-slim as runtime
 ARG SERVER_PORT=3000
 
 # Install curl for health checks and create non-root user
-RUN apt-get update && apt-get install -y curl ca-certificates && rm -rf /var/lib/apt/lists/* && \
-    groupadd -r appuser && useradd -r -g appuser appuser && \
-    groupadd -r docker && usermod -a -G docker appuser
+RUN apt-get update && apt-get install -y \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r appuser && useradd -r -g appuser appuser \
+    && groupadd -r docker && usermod -a -G docker appuser
 
 # Copy SOPS from installer stage
 COPY --from=sops-installer /usr/local/bin/sops /usr/local/bin/sops
@@ -118,8 +121,8 @@ COPY --from=builder /app/target/release/sops-secrets-server /usr/local/bin/sops-
 # Set working directory
 WORKDIR /app
 
-# Switch to non-root user
-USER appuser
+# Add entrypoint script
+COPY --chmod=+x docker/entrypoint-server.sh /entrypoint-server.sh
 
 # Health check for the server binary
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
@@ -135,8 +138,5 @@ ENV SOPS_SERVER_URL=http://localhost:${SERVER_PORT} \
 
 # Expose server port (configurable via SERVER_PORT env var)
 EXPOSE ${SERVER_PORT}
-
-# Add entrypoint script
-COPY --chmod=+x docker/entrypoint-server.sh /entrypoint-server.sh
 
 ENTRYPOINT ["/entrypoint-server.sh"] 

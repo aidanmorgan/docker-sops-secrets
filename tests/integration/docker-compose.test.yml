@@ -14,7 +14,6 @@ services:
     image: sops-secrets-server:test
     container_name: sops-secrets-server-test
     command: [
-      "sops-secrets-server",
       "--port", "3000",
       "--sops-file-path", "/run/secrets/secrets.yaml",
       "--master-key-path", "/run/secrets/master_key.age",

@@ -6,5 +6,11 @@ if [ -S /var/run/docker.sock ]; then
     chmod 660 /var/run/docker.sock 2>/dev/null || true
 fi
 
-# Run the server as appuser
-exec su-exec appuser /usr/local/bin/sops-secrets-server "$@" 
+# Check if we need to switch to appuser
+if [ "$(id -u)" = "0" ] && [ -n "$(getent passwd appuser)" ]; then
+    # We're root and appuser exists, switch to appuser
+    exec setpriv --reuid=appuser --regid=appuser --init-groups /usr/local/bin/sops-secrets-server "$@"
+else
+    # Run as current user
+    exec /usr/local/bin/sops-secrets-server "$@"
+fi 
