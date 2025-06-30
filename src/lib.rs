@@ -1,4 +1,3 @@
-mod cli;
-mod client;
-mod server;
-mod shared;
+pub mod server;
+pub mod client;
+pub mod shared;

@@ -1,16 +1,29 @@
-use std::io::Write;
-use std::path::PathBuf;
-use std::ptr;
+use std::io::{Read, Write};
+use std::time::Duration;
+use age::x25519::{Identity, Recipient};
+use age::{Encryptor, Decryptor};
+use age::armor::{ArmoredReader, ArmoredWriter, Format};
+use age::secrecy::ExposeSecret;
+use tokio::time::timeout;
+use zeroize::Zeroize;
+use thiserror::Error;
 
-/// Zero out a string's memory contents
-fn zero_string(s: &mut String) {
-    unsafe {
-        ptr::write_volatile(s.as_mut_ptr(), 0u8);
-        for i in 1..s.len() {
-            ptr::write_volatile(s.as_mut_ptr().add(i), 0u8);
-        }
-    }
-    s.clear();
+#[derive(Debug, Error)]
+pub enum AgeError {
+    #[error("Timeout")] 
+    Timeout,
+    #[error("Key generation error: {0}")]
+    KeyGen(String),
+    #[error("Encryption error: {0}")]
+    Encryption(String),
+    #[error("Decryption error: {0}")]
+    Decryption(String),
+    #[error("Parse error: {0}")]
+    Parse(String),
+    #[error("Unsupported age file format")]
+    UnsupportedFormat,
+    #[error("Task join error: {0}")]
+    TaskJoin(String),
 }
 
 /// Temporary key pair for write operations
@@ -22,94 +35,75 @@ pub struct TempKeyPair {
 
 impl Drop for TempKeyPair {
     fn drop(&mut self) {
-        zero_string(&mut self.private_key);
-        zero_string(&mut self.public_key);
+        self.private_key.zeroize();
+        self.public_key.zeroize();
     }
 }
 
-/// Generate a temporary age key pair for write operations
-pub fn generate_temp_age_key_pair(age_executable_path: &str) -> Result<TempKeyPair, Box<dyn std::error::Error + Send + Sync>> {
-    use std::process::{Command, Stdio};
+/// Generate a temporary age key pair for write operations with timeout (using age crate)
+pub async fn generate_temp_age_key_pair(
+    timeout_duration: Duration,
+) -> Result<TempKeyPair, AgeError> {
+    let operation = async move {
+        let identity = Identity::generate();
+        let private_key = identity.to_string().expose_secret().to_string();
+        let public_key = identity.to_public().to_string();
 
-    let output = Command::new(age_executable_path)
-        .arg("--generate")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+        Ok(TempKeyPair { private_key, public_key })
+    };
 
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Age key generation failed: {}", error).into());
-    }
-
-    let output_str = String::from_utf8(output.stdout)?;
-    let lines: Vec<&str> = output_str.lines().collect();
-
-    if lines.len() < 2 {
-        return Err("Invalid age key generation output".into());
-    }
-
-    let private_key = lines[0].trim().to_string();
-    let public_key = lines[1].trim().to_string();
-
-    Ok(TempKeyPair {
-        private_key,
-        public_key,
-    })
+    timeout(timeout_duration, operation)
+        .await
+        .map_err(|_| AgeError::Timeout)?
 }
 
-/// Encrypt data with age public key
-pub fn encrypt_with_age_public_key(data: &str, public_key: &str, age_executable_path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new(age_executable_path)
-        .arg("-e")
-        .arg("-r")
-        .arg(public_key)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let stdin = child.stdin.as_mut().ok_or("Failed to get stdin")?;
-    stdin.write_all(data.as_bytes())?;
-    drop(stdin); // Close stdin
-
-    let output = child.wait_with_output()?;
-
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Age encryption failed: {}", error).into());
-    }
-
-    Ok(output.stdout)
+/// Encrypt data with age public key with timeout (using age crate, ASCII armor)
+pub async fn encrypt_with_age_public_key(
+    public_key: &str,
+    data: &str,
+    timeout_duration: Duration,
+) -> Result<Vec<u8>, AgeError> {
+    let public_key = public_key.to_string();
+    let data = data.to_owned();
+    let operation = move || {
+        let recipient = public_key.parse::<Recipient>().map_err(|e| AgeError::Parse(e.to_string()))?;
+        let encryptor = Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient)).map_err(|e| AgeError::Encryption(e.to_string()))?;
+        let mut encrypted = vec![];
+        let mut armor = ArmoredWriter::wrap_output(&mut encrypted, Format::AsciiArmor).map_err(|e| AgeError::Encryption(e.to_string()))?;
+        let mut writer = encryptor.wrap_output(&mut armor).map_err(|e| AgeError::Encryption(e.to_string()))?;
+        writer.write_all(data.as_bytes()).map_err(|e| AgeError::Encryption(e.to_string()))?;
+        writer.finish().map_err(|e| AgeError::Encryption(e.to_string()))?;
+        armor.finish().map_err(|e| AgeError::Encryption(e.to_string()))?;
+        Ok(encrypted)
+    };
+    timeout(timeout_duration, tokio::task::spawn_blocking(operation)).await
+        .map_err(|_| AgeError::Timeout)?
+        .map_err(|e| AgeError::TaskJoin(e.to_string()))?
 }
 
-/// Decrypt data with age private key
-pub fn decrypt_with_age_private_key(age_executable_path: &str, file_path: &PathBuf, private_key: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use std::process::{Command, Stdio};
+/// Decrypt data with age private key with timeout (using age crate, ASCII armor)
+pub async fn decrypt_with_age_private_key(
+    private_key: &str,
+    encrypted_data: &[u8],
+    timeout_duration: Duration,
+) -> Result<String, AgeError> {
+    let private_key = private_key.to_string();
+    let encrypted_data = encrypted_data.to_vec();
 
-    let mut child = Command::new(age_executable_path)
-        .arg("-d")
-        .arg("-i")
-        .arg("-") // Read private key from stdin
-        .arg(file_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let operation = move || {
+        let identity = private_key.parse::<Identity>().map_err(|e| AgeError::Parse(e.to_string()))?;
+        let armor = ArmoredReader::new(&encrypted_data[..]);
+        let decryptor = Decryptor::new(armor).map_err(|e| AgeError::Decryption(e.to_string()))?;
+        
+        let mut reader = decryptor.decrypt(std::iter::once(&identity as &dyn age::Identity)).map_err(|e| AgeError::Decryption(e.to_string()))?;
+        let mut decrypted = String::new();
 
-    let stdin = child.stdin.as_mut().ok_or("Failed to get stdin")?;
-    stdin.write_all(private_key.as_bytes())?;
-    drop(stdin); // Close stdin
+        reader.read_to_string(&mut decrypted).map_err(|e| AgeError::Decryption(e.to_string()))?;
 
-    let output = child.wait_with_output()?;
-
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Age decryption failed: {}", error).into());
-    }
-
-    let decrypted = String::from_utf8(output.stdout)?;
-    Ok(decrypted)
+        Ok(decrypted)
+    };
+    
+    timeout(timeout_duration, tokio::task::spawn_blocking(operation)).await
+        .map_err(|_| AgeError::Timeout)?
+        .map_err(|e| AgeError::TaskJoin(e.to_string()))?
 } 

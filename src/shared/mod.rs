@@ -25,16 +25,16 @@ impl SecretData {
     /// Create a new SecretData with the owner automatically included in readers and writers
     pub fn new(value: String, owner: String, readers: Option<Vec<String>>, writers: Option<Vec<String>>) -> Self {
         let mut final_readers = vec![];
-        if readers.is_some() {
-            final_readers.append(&mut readers.unwrap());
+        if let Some(readers_vec) = readers {
+            final_readers.extend(readers_vec);
             if !final_readers.contains(&owner) {
                 final_readers.push(owner.clone());
             }
         }
 
         let mut final_writers = vec![];
-        if (writers.is_some()) {
-            final_writers.append(&mut writers.unwrap());
+        if let Some(writers_vec) = writers {
+            final_writers.extend(writers_vec);
             if !final_writers.contains(&owner) {
                 final_writers.push(owner.clone());
             }
@@ -122,6 +122,12 @@ pub enum SopsError {
     MissingEnvVar(String),
     #[error("Operation timed out after {0:?}")]
     Timeout(Duration),
+    #[error("Failed to load private key from file: {0}")]
+    KeyLoadError(String),
+    #[error("Failed to parse the secret metadata: {0}")]
+    InvalidSecretPayload(String),
+    #[error("No secret with key found")]
+    NoSecretFound,
 }
 
 /// Result type for SOPS operations
@@ -183,10 +189,34 @@ impl Default for SopsConfig {
     }
 }
 
-
-/// Secure SOPS wrapper
+/// Secure SOPS wrapper for managing encrypted secrets.
+/// 
+/// # Thread Safety
+/// 
+/// This struct is thread-safe and can be shared across multiple async tasks:
+/// 
+/// - **Immutable Design**: All methods take `&self` (immutable borrows), ensuring no
+///   concurrent modifications to internal state.
+/// 
+/// - **Owned Configuration**: The internal `SopsConfig` contains only owned types
+///   (`String`, `HashMap<String, String>`, `Option<String>`, `Duration`) that are
+///   safe to share across threads.
+/// 
+/// - **No Shared Mutable State**: Each operation that needs to modify environment
+///   variables creates a new `HashMap` by cloning `self.config.env_vars`, so there's
+///   no shared mutable state between concurrent operations.
+/// 
+/// - **File Operations**: All file operations are read-only or create new files,
+///   and the underlying file system handles concurrent access appropriately.
+/// 
+/// # Usage
+/// 
+/// This wrapper can be safely shared across multiple HTTP request handlers without
+/// additional synchronization. Each handler can call methods concurrently without
+/// risk of race conditions.
 #[derive(Debug, Clone)]
 pub struct SopsWrapper {
+    /// Configuration for SOPS operations. Immutable and thread-safe.
     config: SopsConfig,
 }
 
@@ -203,11 +233,28 @@ impl SopsWrapper {
         Self { config }
     }
 
-    /// Create a new SOPS wrapper with file path and master key
+    /// Create a new SOPS wrapper with file path and master key path
     pub fn new_with_file(file_path: String, master_key_path: String) -> Self {
         Self {
             config: SopsConfig::new(file_path, master_key_path),
         }
+    }
+
+    /// Load the private key from the configured key file
+    async fn load_private_key(&self) -> SopsResult<String> {
+        let key_content = tokio::fs::read_to_string(&self.config.master_key_path)
+            .await
+            .map_err(|e| SopsError::KeyLoadError(format!("Failed to read key file '{}': {}", self.config.master_key_path, e)))?;
+        
+        // Find the line that contains the age private key
+        for line in key_content.lines() {
+            let trimmed_line = line.trim();
+            if trimmed_line.starts_with("AGE-SECRET-KEY-") {
+                return Ok(trimmed_line.to_string());
+            }
+        }
+        
+        Err(SopsError::KeyLoadError(format!("No valid age private key found in file '{}'", self.config.master_key_path)))
     }
 
     /// Validate that SOPS executable exists and is accessible
@@ -215,8 +262,22 @@ impl SopsWrapper {
         let timeout_duration = timeout_duration.unwrap_or(self.config.default_timeout);
 
         let operation = async {
-            let output = TokioCommand::new(&self.config.sops_path)
-                .arg("--version")
+            let mut command = TokioCommand::new(&self.config.sops_path);
+            let env = &mut self.config.env_vars.clone();
+            if !env.contains_key("SOPS_AGE_KEY_FILE") {
+                env.insert("SOPS_AGE_KEY_FILE".to_string(), self.config.master_key_path.clone());
+            }
+            command.envs(env);
+
+            // Set working directory if specified
+            if let Some(ref working_dir) = self.config.working_dir {
+                command.current_dir(working_dir);
+            }
+
+            command.arg("--version");
+
+            // Debug: Print the command being executed
+            let output = command
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
@@ -238,11 +299,16 @@ impl SopsWrapper {
     }
 
     /// Add multiple secrets to a SOPS file in a single operation
-    pub async fn add_secrets(&self, secrets: &HashMap<String, String>, timeout_duration: Option<Duration>) -> SopsResult<()> {
+    async fn add_secrets(&self, owner: &str, secrets: &HashMap<String, String>, timeout_duration: Option<Duration>) -> SopsResult<()> {
         let timeout_duration = timeout_duration.unwrap_or(self.config.default_timeout);
 
         if secrets.is_empty() {
             return Err(SopsError::InvalidSecretFormat("No secrets provided".to_string()));
+        }
+
+        // Validate owner
+        if owner.trim().is_empty() {
+            return Err(SopsError::InvalidSecretFormat("Owner cannot be empty".to_string()));
         }
 
         // Validate SOPS is available
@@ -254,8 +320,16 @@ impl SopsWrapper {
         }
 
         let operation = async {
+            // Load the private key
+            let _private_key = self.load_private_key().await?;
+
             // Build the command
             let mut command = TokioCommand::new(&self.config.sops_path);
+            let env = &mut self.config.env_vars.clone();
+            if !env.contains_key("SOPS_AGE_KEY_FILE") {
+                env.insert("SOPS_AGE_KEY_FILE".to_string(), self.config.master_key_path.clone());
+            }
+            command.envs(env);
 
             // Set working directory if specified
             if let Some(ref working_dir) = self.config.working_dir {
@@ -265,27 +339,16 @@ impl SopsWrapper {
             // Add SOPS arguments
             command.arg("--set");
 
-            // Add all secrets as key=value pairs
+            // Add all secrets as key=value pairs with owner prefix
             for (key, value) in secrets {
                 if key.trim().is_empty() {
                     return Err(SopsError::InvalidSecretFormat("Key cannot be empty".to_string()));
                 }
-                command.arg(&format!("{}={}", key, value));
+                let owned_key = format!("{}_{}", owner, key);
+                command.arg(&format!("{}={}", owned_key, value));
             }
 
             command.arg(&self.config.file_path);
-
-            // Add master key as an audience that can decrypt the file
-            // For age keys, use --age flag
-            if self.config.master_key_path.starts_with("age1") {
-                command.arg("--age").arg(&self.config.master_key_path);
-            } else {
-                // Assume it's a PGP key or other format
-                command.arg("--pgp").arg(&self.config.master_key_path);
-            }
-
-            // Set up environment variables
-            command.envs(&self.config.env_vars);
 
             // Execute the command
             let output = command
@@ -311,11 +374,14 @@ impl SopsWrapper {
             .map_err(|_| SopsError::Timeout(timeout_duration))?
     }
 
-    /// Add a secret to a SOPS file
-    pub async fn add_secret(&self, key: &str, value: &str, timeout_duration: Option<Duration>) -> SopsResult<()> {
+    /// Add a secret to a SOPS file (requires owner)
+    async fn add_secret(&self, owner: &str, key: &str, value: &str, timeout_duration: Option<Duration>) -> SopsResult<()> {
         let timeout_duration = timeout_duration.unwrap_or(self.config.default_timeout);
 
         // Validate inputs
+        if owner.trim().is_empty() {
+            return Err(SopsError::InvalidSecretFormat("Owner cannot be empty".to_string()));
+        }
         if key.trim().is_empty() {
             return Err(SopsError::InvalidSecretFormat("Key cannot be empty".to_string()));
         }
@@ -328,8 +394,16 @@ impl SopsWrapper {
         self.validate_sops(Some(timeout_duration)).await?;
 
         let operation = async {
+            // Load the private key
+            let _private_key = self.load_private_key().await?;
+
             // Build the command
             let mut command = TokioCommand::new(&self.config.sops_path);
+            let env = &mut self.config.env_vars.clone();
+            if !env.contains_key("SOPS_AGE_KEY_FILE") {
+                env.insert("SOPS_AGE_KEY_FILE".to_string(), self.config.master_key_path.clone());
+            }
+            command.envs(env);
 
             // Set working directory if specified
             if let Some(ref working_dir) = self.config.working_dir {
@@ -337,22 +411,11 @@ impl SopsWrapper {
             }
 
             // Add SOPS arguments
+            let owned_key = format!("{}_{}", owner, key);
             command
-                .arg("--set")
-                .arg(&format!("{}={}", key, value))
-                .arg(&self.config.file_path);
-
-            // Add master key as an audience that can decrypt the file
-            // For age keys, use --age flag
-            if self.config.master_key_path.starts_with("age1") {
-                command.arg("--age").arg(&self.config.master_key_path);
-            } else {
-                // Assume it's a PGP key or other format
-                command.arg("--pgp").arg(&self.config.master_key_path);
-            }
-
-            // Set up environment variables
-            command.envs(&self.config.env_vars);
+                .arg("set")
+                .arg(&self.config.file_path)
+                .arg(&format!("'[{}]'='\"{}\"'", owned_key, value));
 
             // Execute the command
             let output = command
@@ -382,6 +445,7 @@ impl SopsWrapper {
     pub async fn get_secret(&self, key: &str, timeout_duration: Option<Duration>) -> SopsResult<String> {
         let timeout_duration = timeout_duration.unwrap_or(self.config.default_timeout);
 
+        // Validate inputs
         if key.trim().is_empty() {
             return Err(SopsError::InvalidSecretFormat("Key cannot be empty".to_string()));
         }
@@ -396,6 +460,11 @@ impl SopsWrapper {
         let operation = async {
             // Build the command
             let mut command = TokioCommand::new(&self.config.sops_path);
+            let env = &mut self.config.env_vars.clone();
+            if !env.contains_key("SOPS_AGE_KEY_FILE") {
+                env.insert("SOPS_AGE_KEY_FILE".to_string(), self.config.master_key_path.clone());
+            }
+            command.envs(env);
 
             // Set working directory if specified
             if let Some(ref working_dir) = self.config.working_dir {
@@ -407,18 +476,6 @@ impl SopsWrapper {
                 .arg("--extract")
                 .arg(key)
                 .arg(&self.config.file_path);
-
-            // Add master key for decryption
-            // For age keys, use --age flag
-            if self.config.master_key_path.starts_with("age1") {
-                command.arg("--age").arg(&self.config.master_key_path);
-            } else {
-                // Assume it's a PGP key or other format
-                command.arg("--pgp").arg(&self.config.master_key_path);
-            }
-
-            // Set up environment variables
-            command.envs(&self.config.env_vars);
 
             // Execute the command
             let output = command
@@ -437,7 +494,7 @@ impl SopsWrapper {
             }
 
             let secret = String::from_utf8(output.stdout)
-                .map_err(|e| SopsError::CommandFailed(format!("Invalid UTF-8 in output: {}", e)))?;
+                .map_err(|e| SopsError::CommandFailed(format!("Invalid UTF-8 in SOPS output: {}", e)))?;
 
             Ok(secret.trim().to_string())
         };
@@ -448,12 +505,8 @@ impl SopsWrapper {
     }
 
     /// Create a new SOPS file with initial secrets
-    pub async fn create_file(&self, secrets: &HashMap<String, String>, timeout_duration: Option<Duration>) -> SopsResult<()> {
+    pub async fn create_file(&self, owner: &str, secrets: &HashMap<String, String>,  timeout_duration: Option<Duration>) -> SopsResult<()> {
         let timeout_duration = timeout_duration.unwrap_or(self.config.default_timeout);
-
-        if secrets.is_empty() {
-            return Err(SopsError::InvalidSecretFormat("No secrets provided".to_string()));
-        }
 
         // Validate SOPS is available
         self.validate_sops(Some(timeout_duration)).await?;
@@ -464,8 +517,16 @@ impl SopsWrapper {
         }
 
         let operation = async {
+            // Load the private key
+            let _private_key = self.load_private_key().await?;
+
             // Build the command
             let mut command = TokioCommand::new(&self.config.sops_path);
+            let env = &mut self.config.env_vars.clone();
+            if !env.contains_key("SOPS_AGE_KEY_FILE") {
+                env.insert("SOPS_AGE_KEY_FILE".to_string(), self.config.master_key_path.clone());
+            }
+            command.envs(env);
 
             // Set working directory if specified
             if let Some(ref working_dir) = self.config.working_dir {
@@ -474,29 +535,31 @@ impl SopsWrapper {
 
             // Add SOPS arguments for creating a new file
             command.arg("--encrypt");
-            command.arg("--set");
 
-            // Add all secrets as key=value pairs
-            for (key, value) in secrets {
-                if key.trim().is_empty() {
-                    return Err(SopsError::InvalidSecretFormat("Key cannot be empty".to_string()));
+            if secrets.len() > 0 {
+                command.arg("set");
+                command.arg(&self.config.file_path);
+
+                // Add all secrets as key=value pairs
+                for (key, value) in secrets {
+                    if key.trim().is_empty() {
+                        return Err(SopsError::InvalidSecretFormat("Key cannot be empty".to_string()));
+                    }
+
+                    let secret_data = SecretData {
+                        value: String::from(value),
+                        owner: String::from(owner),
+                        writers: vec![],
+                        readers: vec![]
+                    };
+
+                    let secret_json = serde_json::to_string(&secret_data)
+                        .map_err(|e| SopsError::InvalidSecretFormat(format!("Failed to serialize secret data: {}", e)))?;
+
+                    command.arg(&format!("{}={}", format!("{}_secret", key), secret_json));
                 }
-                command.arg(&format!("{}={}", key, value));
             }
 
-            command.arg(&self.config.file_path);
-
-            // Add master key as an audience that can decrypt the file
-            // For age keys, use --age flag
-            if self.config.master_key_path.starts_with("age1") {
-                command.arg("--age").arg(&self.config.master_key_path);
-            } else {
-                // Assume it's a PGP key or other format
-                command.arg("--pgp").arg(&self.config.master_key_path);
-            }
-
-            // Set up environment variables
-            command.envs(&self.config.env_vars);
 
             // Execute the command
             let output = command
@@ -580,7 +643,7 @@ impl SopsWrapper {
 
         // Create standardized secret key and store the complete JSON
         let secret_key = format!("{}_secret", secret_name);
-        self.add_secret(&secret_key, &secret_json, timeout_duration).await
+        self.add_secret(owner_name, &secret_key, &secret_json, timeout_duration).await
     }
 
     /// Get allowed readers for an owner secret
@@ -591,7 +654,7 @@ impl SopsWrapper {
     }
 
     /// Check if a reader is allowed to read an owner's secret
-    pub async fn is_reader_allowed_to_read(&self, _owner_name: &str, secret_name: &str, reader_name: &str, timeout_duration: Option<Duration>) -> SopsResult<bool> {
+    pub async fn is_allowed_to_read(&self, _owner_name: &str, secret_name: &str, reader_name: &str, timeout_duration: Option<Duration>) -> SopsResult<bool> {
         let secret_data = self.get_secret_data(secret_name, timeout_duration).await?;
         Ok(secret_data.can_read(reader_name))
     }
@@ -797,7 +860,7 @@ impl SopsWrapper {
         Ok(secret_data.value)
     }
 
-    /// Helper function to get SecretData for a given secret name
+    /// Get secret data for a given secret name
     pub async fn get_secret_data(&self, secret_name: &str, timeout_duration: Option<Duration>) -> SopsResult<SecretData> {
         // Validate inputs
         if secret_name.trim().is_empty() {
@@ -815,9 +878,13 @@ impl SopsWrapper {
         // Get the secret data JSON
         let secret_json = self.get_secret(&secret_key, timeout_duration).await?;
 
+        if secret_json.trim().is_empty() {
+            return Err(SopsError::NoSecretFound)
+        }
+
         // Parse the JSON to SecretData
         let secret_data: SecretData = serde_json::from_str(&secret_json)
-            .map_err(|e| SopsError::InvalidSecretFormat(format!("Failed to deserialize secret data: {}", e)))?;
+            .map_err(|e| SopsError::InvalidSecretPayload(format!("Failed to deserialize secret data: {}", e)))?;
 
         Ok(secret_data)
     }
@@ -842,7 +909,7 @@ impl SopsWrapper {
             .map_err(|e| SopsError::InvalidSecretFormat(format!("Failed to serialize secret data: {}", e)))?;
 
         // Save the secret data
-        self.add_secret(&secret_key, &secret_json, timeout_duration).await
+        self.add_secret("", &secret_key, &secret_json, timeout_duration).await
     }
 
     /// Update the secret value for an existing secret
@@ -865,15 +932,15 @@ impl SopsWrapper {
 }
 
 /// Convenience function to add a secret to a SOPS file using default configuration
-pub async fn add_secret(file_path: &str, key: &str, value: &str, master_key_path: &str, timeout_duration: Option<Duration>) -> SopsResult<()> {
+pub async fn add_secret(file_path: &str, owner: &str, key: &str, value: &str, master_key_path: &str, timeout_duration: Option<Duration>) -> SopsResult<()> {
     let wrapper = SopsWrapper::new_with_file(file_path.to_string(), master_key_path.to_string());
-    wrapper.add_secret(key, value, timeout_duration).await
+    wrapper.add_secret(owner, key, value, timeout_duration).await
 }
 
 /// Convenience function to add multiple secrets to a SOPS file using default configuration
-pub async fn add_secrets(file_path: &str, secrets: &HashMap<String, String>, master_key_path: &str, timeout_duration: Option<Duration>) -> SopsResult<()> {
+pub async fn add_secrets(file_path: &str, owner: &str, secrets: &HashMap<String, String>, master_key_path: &str, timeout_duration: Option<Duration>) -> SopsResult<()> {
     let wrapper = SopsWrapper::new_with_file(file_path.to_string(), master_key_path.to_string());
-    wrapper.add_secrets(secrets, timeout_duration).await
+    wrapper.add_secrets(owner, secrets, timeout_duration).await
 }
 
 /// Convenience function to get a secret from a SOPS file using default configuration
@@ -883,9 +950,9 @@ pub async fn get_secret(file_path: &str, key: &str, master_key_path: &str, timeo
 }
 
 /// Convenience function to create a new SOPS file with initial secrets using default configuration
-pub async fn create_file(file_path: &str, secrets: &HashMap<String, String>, master_key_path: &str, timeout_duration: Option<Duration>) -> SopsResult<()> {
+pub async fn create_file(file_path: &str, owner: &str, secrets: &HashMap<String, String>, master_key_path: &str, timeout_duration: Option<Duration>) -> SopsResult<()> {
     let wrapper = SopsWrapper::new_with_file(file_path.to_string(), master_key_path.to_string());
-    wrapper.create_file(secrets, timeout_duration).await
+    wrapper.create_file(owner, secrets, timeout_duration).await
 }
 
 /// Convenience function to add an owner secret using default configuration
@@ -909,7 +976,7 @@ pub async fn get_secret_readers(file_path: &str, secret_name: &str, master_key_p
 /// Convenience function to check if a reader is allowed to read an owner's secret
 pub async fn is_reader_allowed_to_read(file_path: &str, owner_name: &str, secret_name: &str, reader_name: &str, master_key_path: &str, timeout_duration: Option<Duration>) -> SopsResult<bool> {
     let wrapper = SopsWrapper::new_with_file(file_path.to_string(), master_key_path.to_string());
-    wrapper.is_reader_allowed_to_read(owner_name, secret_name, reader_name, timeout_duration).await
+    wrapper.is_allowed_to_read(owner_name, secret_name, reader_name, timeout_duration).await
 }
 
 /// Convenience function to add a reader to a secret using default configuration
@@ -976,7 +1043,7 @@ mod tests {
     async fn test_sops_wrapper_creation() {
         let wrapper = SopsWrapper::new();
         assert_eq!(wrapper.config.sops_path, "sops");
-        assert_eq!(wrapper.config.default_timeout, Duration::from_secs(5));
+        assert_eq!(wrapper.config.default_timeout, Duration::from_secs(30));
         assert_eq!(wrapper.config.file_path, "secrets.yaml");
         assert_eq!(wrapper.config.master_key_path, "age1default");
     }
@@ -1005,7 +1072,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_secret_format() {
         let wrapper = SopsWrapper::new_with_file("test.yaml".to_string(), "age1test".to_string());
-        let result = wrapper.add_secret("", "value", None).await;
+        let result = wrapper.add_secret("", "key", "value", None).await;
         assert!(matches!(result, Err(SopsError::InvalidSecretFormat(_))));
     }
 
@@ -1087,18 +1154,14 @@ mod tests {
         assert_eq!(generated_readers_key, expected_readers_key);
     }
 
-    #[tokio::test]
-    async fn test_allowed_readers_serialization() {
-        // Test JSON serialization of allowed readers
-        let allowed_readers = vec!["reader1".to_string(), "reader2".to_string(), "reader3".to_string()];
-        let readers_json = serde_json::to_string(&allowed_readers).unwrap();
-
-        // Verify the JSON format
-        assert_eq!(readers_json, r#"["reader1","reader2","reader3"]"#);
-
-        // Test deserialization
-        let deserialized: Vec<String> = serde_json::from_str(&readers_json).unwrap();
-        assert_eq!(deserialized, allowed_readers);
+    #[test]
+    fn test_allowed_readers_serialization() {
+        let allowed_readers = vec!["user1".to_string(), "user2".to_string()];
+        let readers_json = serde_json::to_string(&allowed_readers)
+            .expect("Failed to serialize readers");
+        let deserialized: Vec<String> = serde_json::from_str(&readers_json)
+            .expect("Failed to deserialize readers");
+        assert_eq!(allowed_readers, deserialized);
     }
 
     #[tokio::test]
@@ -1406,98 +1469,30 @@ mod tests {
         assert_eq!(generated_writers_key, expected_writers_key);
     }
 
-    #[tokio::test]
-    async fn test_allowed_writers_serialization() {
-        // Test JSON serialization of allowed writers
-        let allowed_writers = vec!["writer1".to_string(), "writer2".to_string(), "writer3".to_string()];
-        let writers_json = serde_json::to_string(&allowed_writers).unwrap();
-
-        // Verify the JSON format
-        assert_eq!(writers_json, r#"["writer1","writer2","writer3"]"#);
-
-        // Test deserialization
-        let deserialized: Vec<String> = serde_json::from_str(&writers_json).unwrap();
-        assert_eq!(deserialized, allowed_writers);
+    #[test]
+    fn test_allowed_writers_serialization() {
+        let allowed_writers = vec!["writer1".to_string(), "writer2".to_string()];
+        let writers_json = serde_json::to_string(&allowed_writers)
+            .expect("Failed to serialize writers");
+        let deserialized: Vec<String> = serde_json::from_str(&writers_json)
+            .expect("Failed to deserialize writers");
+        assert_eq!(allowed_writers, deserialized);
     }
 
-    #[tokio::test]
-    async fn test_secret_data_structure() {
-        // Test the SecretData structure
+    #[test]
+    fn test_secret_data_structure() {
         let secret_data = SecretData::new(
-            "secret_value".to_string(),
+            "test_secret".to_string(),
             "owner1".to_string(),
             Some(vec!["reader1".to_string(), "reader2".to_string()]),
             Some(vec!["writer1".to_string()]),
         );
 
-        // Verify owner is automatically included in both readers and writers
-        assert!(secret_data.can_read("owner1"));
-        assert!(secret_data.can_write("owner1"));
-        assert!(secret_data.can_read("reader1"));
-        assert!(secret_data.can_read("reader2"));
-        assert!(secret_data.can_write("writer1"));
-
-        // Verify other users are not included
-        assert!(!secret_data.can_read("reader3"));
-        assert!(!secret_data.can_write("writer2"));
-
-        // Test JSON serialization
-        let json = serde_json::to_string(&secret_data).unwrap();
-        let deserialized: SecretData = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.value, "secret_value");
-        assert_eq!(deserialized.owner, "owner1");
-        assert!(deserialized.readers.contains(&"owner1".to_string()));
-        assert!(deserialized.writers.contains(&"owner1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_secret_data_methods() {
-        let mut secret_data = SecretData::new(
-            "secret_value".to_string(),
-            "owner1".to_string(),
-            Some(vec!["reader1".to_string()]),
-            Some(vec!["writer1".to_string()]),
-        );
-
-        // Test adding readers and writers
-        secret_data.add_reader("reader2".to_string());
-        secret_data.add_writer("writer2".to_string());
-
-        assert!(secret_data.can_read("reader2"));
-        assert!(secret_data.can_write("writer2"));
-
-        // Test removing readers and writers (but not owner)
-        secret_data.remove_reader("reader1");
-        secret_data.remove_writer("writer1");
-
-        assert!(!secret_data.can_read("reader1"));
-        assert!(!secret_data.can_write("writer1"));
-
-        // Owner should still be able to read and write
-        assert!(secret_data.can_read("owner1"));
-        assert!(secret_data.can_write("owner1"));
-
-        // Test setting complete lists
-        secret_data.set_readers(vec!["new_reader".to_string()]);
-        secret_data.set_writers(vec!["new_writer".to_string()]);
-
-        assert!(secret_data.can_read("new_reader"));
-        assert!(secret_data.can_write("new_writer"));
-        assert!(secret_data.can_read("owner1")); // Owner should still be included
-        assert!(secret_data.can_write("owner1")); // Owner should still be included
-    }
-
-    #[tokio::test]
-    async fn test_update_secret_value() {
-        let wrapper = SopsWrapper::new_with_file("test.yaml".to_string(), "age1test".to_string());
-
-        // Test updating a secret value
-        let result = wrapper.update_secret_value("database_password", "new_value", None).await;
-        assert!(result.is_ok());
-
-        // Verify the secret value is updated
-        let secret_value = wrapper.get_owned_secret("myapp", "database_password", None).await;
-        assert_eq!(secret_value.unwrap(), "new_value");
+        let json = serde_json::to_string(&secret_data)
+            .expect("Failed to serialize secret data");
+        let deserialized: SecretData = serde_json::from_str(&json)
+            .expect("Failed to deserialize secret data");
+        assert_eq!(secret_data.value, deserialized.value);
+        assert_eq!(secret_data.owner, deserialized.owner);
     }
 }

@@ -1,0 +1,137 @@
+# Multi-stage build for sops-secrets server binary
+# Stage 1: Build stage with Rust toolchain
+FROM cgr.dev/chainguard/rust:latest as builder
+
+# Build arguments
+ARG RUST_VERSION=1.75
+ARG RUST_TARGET=release
+ARG SOPS_VERSION=v3.10.2
+ARG SERVER_PORT=3000
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    curl \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for building
+RUN groupadd -r rustuser && useradd -r -g rustuser rustuser
+
+# Set working directory
+WORKDIR /app
+
+# Copy Cargo files first for better layer caching
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy source files to build dependencies
+RUN mkdir -p src/bin && \
+    echo "fn main() {}" > src/lib.rs && \
+    echo "fn main() {}" > src/bin/server.rs && \
+    mkdir -p src/shared && \
+    echo "pub mod age;" > src/shared/mod.rs && \
+    echo "pub struct AgeError;" > src/shared/age.rs && \
+    mkdir -p src/server && \
+    echo "pub mod docker;" > src/server/mod.rs && \
+    echo "pub struct DockerError;" > src/server/docker.rs
+
+# Build dependencies only (this layer will be cached)
+RUN cargo build --release --bin sops-secrets-server
+
+# Remove dummy source files
+RUN rm -rf src/
+
+# Copy actual source code
+COPY src/ ./src/
+
+# Build the actual server binary
+RUN cargo build --release --bin sops-secrets-server
+
+# Stage 2: SOPS installation and validation
+FROM debian:bullseye-slim AS sops-installer
+
+# Build arguments
+ARG SOPS_VERSION=v3.10.2
+
+# Install dependencies for SOPS installation
+RUN apt-get update && apt-get install -y \
+    curl \
+    gnupg \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and install SOPS with verification
+RUN set -eux; \
+    # Download SOPS binary
+    curl -fsSL "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.linux.amd64" -o /tmp/sops; \
+    # Download checksums file
+    curl -fsSL "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.checksums.txt" -o /tmp/sops.checksums.txt; \
+    # Verify binary integrity using checksums file
+    cd /tmp && sha256sum -c sops.checksums.txt --ignore-missing; \
+    # Install SOPS
+    chmod +x /tmp/sops; \
+    mv /tmp/sops /usr/local/bin/sops; \
+    # Verify installation
+    sops --version
+
+# Stage 3: Runtime stage with minimal secure base image
+FROM debian:bookworm-slim as runtime
+
+# Build arguments
+ARG SERVER_PORT=3000
+
+# Install runtime dependencies and security updates
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl1.1 \
+    curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /tmp/* /var/tmp/*
+
+# Create non-root user for running the application
+RUN groupadd -r appuser && useradd -r -g appuser -s /sbin/nologin appuser
+
+# Create necessary directories with proper permissions
+RUN mkdir -p /var/tmp/sops-secrets /run/secrets /var/log/sops-secrets /app \
+    && chown -R appuser:appuser /var/tmp/sops-secrets /run/secrets /var/log/sops-secrets /app \
+    && chmod 750 /var/tmp/sops-secrets /run/secrets \
+    && chmod 755 /var/log/sops-secrets /app
+
+# Copy SOPS from installer stage
+COPY --from=sops-installer --chown=appuser:appuser /usr/local/bin/sops /usr/local/bin/sops
+
+# Copy server binary from builder stage
+COPY --from=builder --chown=appuser:appuser /app/target/release/sops-secrets-server /usr/local/bin/
+
+# Set executable permissions
+RUN chmod +x /usr/local/bin/sops-secrets-server /usr/local/bin/sops
+
+# Create symlink for easier access
+RUN ln -s /usr/local/bin/sops-secrets-server /usr/local/bin/server
+
+# Switch to non-root user
+USER appuser
+
+# Set working directory
+WORKDIR /app
+
+# Health check for the server binary
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:${SERVER_PORT}/health || exit 1
+
+# Default environment variables
+ENV SOPS_SERVER_URL=http://localhost:${SERVER_PORT} \
+    SECRETS_WORKING_DIR=/var/tmp/sops-secrets \
+    MASTER_KEY_PATH=/run/secrets/master_key.age \
+    SOPS_FILE_PATH=/run/secrets/secrets.yaml \
+    SERVER_TIMEOUT_SECONDS=30 \
+    SERVER_PORT=${SERVER_PORT}
+
+# Expose server port (configurable via SERVER_PORT env var)
+EXPOSE ${SERVER_PORT}
+
+# Default command
+CMD ["server"] 
