@@ -1,0 +1,142 @@
+# Multi-stage build for sops-secrets server binary
+# Stage 1: Dependencies installation
+FROM rust:bookworm as deps
+
+# Build arguments
+ARG RUST_VERSION=1.76
+ARG RUST_TARGET=release
+ARG ENABLE_TEST_LOGGING=false
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    curl \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for building
+RUN groupadd -r rustuser && useradd -r -g rustuser rustuser
+
+
+# Set working directory
+WORKDIR /app
+
+# Copy Cargo files first for better layer caching
+COPY Cargo.toml Cargo.lock ./
+
+# Build dependencies only (this layer will be cached)
+RUN mkdir -p src && touch src/lib.rs
+RUN cargo fetch
+
+# Stage 2: Build stage with actual source code
+FROM deps as builder
+
+# Copy actual source code
+COPY src/ ./src/
+
+# Build the actual server binary
+RUN if [ "$ENABLE_TEST_LOGGING" = "true" ]; then \
+        cargo build --release --bin sops-secrets-server --features test_logging; \
+    else \
+        cargo build --release --bin sops-secrets-server; \
+    fi
+
+# Stage 3: SOPS installation and validation
+FROM debian:bookworm-slim AS sops-installer
+
+# Build arguments
+ARG SOPS_VERSION=v3.10.2
+ARG ARCH=amd64
+
+# Install dependencies for SOPS installation
+RUN apt-get update && apt-get install -y \
+    curl \
+    gnupg \
+    ca-certificates \
+    libssl-dev \
+    libssl3 \
+    coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and install SOPS with verification following official instructions
+RUN set -eux; \
+    # Download SOPS binary
+    curl -LO https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.linux.${ARCH}; \
+    # Download checksums file
+    curl -LO https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.checksums.txt; \
+    # Verify binary integrity using checksums file
+    sha256sum -c sops-${SOPS_VERSION}.checksums.txt --ignore-missing; \
+    # Install SOPS
+    mv sops-${SOPS_VERSION}.linux.${ARCH} /usr/local/bin/sops; \
+    chmod +x /usr/local/bin/sops; \
+    # Verify installation
+    sops --version
+
+# Stage 4: Age installation and validation
+FROM debian:bookworm-slim AS age-installer
+
+# Build arguments
+ARG AGE_VERSION=v1.2.1
+ARG ARCH=amd64
+
+# Install dependencies for age installation
+RUN apt-get update && apt-get install -y \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and install age
+RUN curl -fsSL "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-linux-${ARCH}.tar.gz" -o /tmp/age.tar.gz && \
+    tar -xzf /tmp/age.tar.gz -C /tmp && \
+    mv /tmp/age/age /usr/local/bin/age && \
+    chmod +x /usr/local/bin/age && \
+    rm -rf /tmp/age /tmp/age.tar.gz && \
+    age --version
+
+# Stage 5: Runtime stage with minimal Debian image
+FROM debian:bookworm-slim as runtime
+
+# Build arguments
+ARG SERVER_PORT=3102
+
+# Install curl for health checks and create non-root user
+RUN apt-get update && apt-get install -y \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r appuser && useradd -r -g appuser appuser \
+    && groupadd -r docker && usermod -a -G docker appuser
+
+# Copy SOPS from installer stage
+COPY --from=sops-installer /usr/local/bin/sops /usr/local/bin/sops
+
+# Copy age from installer stage
+COPY --from=age-installer /usr/local/bin/age /usr/local/bin/age
+
+# Copy server binary from builder stage
+COPY --from=builder /app/target/release/sops-secrets-server /usr/local/bin/sops-secrets-server
+
+# Set working directory
+WORKDIR /app
+
+# Add entrypoint script
+COPY --chmod=+x docker/entrypoint-server.sh /entrypoint-server.sh
+
+# Health check for the server binary
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["curl", "-f", "http://localhost:3102/health"]
+
+# Default environment variables
+ENV SOPS_SERVER_URL=http://localhost:${SERVER_PORT} \
+    SECRETS_WORKING_DIR=/var/tmp/sops-secrets \
+    MASTER_KEY_PATH=/etc/sops-secrets/master_key.age \
+    SOPS_FILE_PATH=/etc/sops-secrets/secrets.yaml \
+    SERVER_TIMEOUT_SECONDS=30 \
+    SERVER_PORT=${SERVER_PORT}
+
+# Expose server port (configurable via SERVER_PORT env var)
+EXPOSE ${SERVER_PORT}
+
+ENTRYPOINT ["/entrypoint-server.sh"] 

@@ -1,0 +1,14 @@
+[project]
+name = "docker-sops-secrets"
+version = "0.1.0"
+description = "Docker-based SOPS secrets management system"
+requires-python = ">=3.8"
+
+[tool.uv.workspace]
+members = [
+    "clients/python",
+    "core/tests/integration-local"
+]
+
+[tool.uv.sources]
+sops-secrets-client = { workspace = true } 
