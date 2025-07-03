@@ -5,21 +5,29 @@ edition = "2024"
 
 [features]
 insecure_mode = []
+secure_mode = []
 
 [[bin]]
 name = "sops-secrets-server"
 path = "src/bin/server.rs"
+required-features = ["secure_mode"]
 
 [[bin]]
-# This is intentionally the same source file for different binary names as we use the insecure_mode feature to enable/disable
-# logging and docker security checks
+
 name = "sops-secrets-server-local"
 path = "src/bin/server.rs"
 required-features = ["insecure_mode"]
 
+
 [[bin]]
 name = "sops-secrets-cli"
 path = "src/bin/cli.rs"
+required-features = ["secure_mode"]
+
+[[bin]]
+name = "sops-secrets-cli-local"
+path = "src/bin/cli.rs"
+required-features = ["insecure_mode"]
 
 [[bin]]
 name = "sops-secrets-exporter"
@@ -49,6 +57,7 @@ hex = "0.4"
 regex = "1.10"
 lazy_static = "1.4"
 libc = "0.2"
+futures = "0.3.31"
 # hyper = { version = "0.14", features = ["server"] }
 
 [dev-dependencies]

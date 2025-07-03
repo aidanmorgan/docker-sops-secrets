@@ -251,6 +251,8 @@ class IntegrationTestHelper:
             "SOPS_MASTER_KEY_PATH": str(self.master_key_path),
             "SECRETS_DIR": str(self.secrets_dir),
             "DOCKER_VALIDATION_LEVEL": "none",  # Disable Docker validation
+            "SOPS_TIMEOUT_SECONDS": "30",  # Increase SOPS timeout to 30 seconds
+            "RUST_LOG": "debug",  # Enable debug logging to see SOPS commands
         })
 
         # Create a log file for the server output
@@ -366,8 +368,20 @@ class IntegrationTestHelper:
 @pytest.fixture(scope="session")
 def temp_dir() -> Generator[Path, None, None]:
     """Create a temporary directory for the test session."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        yield Path(temp_dir)
+    # Check if we should preserve the temp directory for debugging
+    preserve_temp = os.environ.get("PRESERVE_TEMP_DIR", "").lower() in ("1", "true", "yes")
+    
+    if preserve_temp:
+        # Create a persistent temp directory for debugging
+        temp_dir = Path(f"/tmp/sops_test_debug_{int(time.time())}_{os.getpid()}")
+        temp_dir.mkdir(exist_ok=True)
+        print(f"🔍 DEBUG MODE: Preserving temp directory at: {temp_dir}")
+        print(f"🔍 To clean up manually, run: rm -rf {temp_dir}")
+        yield temp_dir
+    else:
+        # Normal cleanup behavior
+        with tempfile.TemporaryDirectory() as temp_dir:
+            yield Path(temp_dir)
 
 
 @pytest.fixture(scope="session")
@@ -386,11 +400,11 @@ def server_url(server_port: int) -> str:
 def local_binary() -> Path:
     """Get the path to the local server binary."""
     # Get the path relative to the core directory (parent of tests directory)
-    binary = Path(__file__).parent.parent.parent / "target/release/sops-secrets-server-local"
+    binary = Path(__file__).parent.parent.parent / "target/debug/sops-secrets-server-local"
     if not binary.exists():
         raise RuntimeError(
             f"Local server binary not found at {binary}. "
-            "Run: cargo build --release --features insecure_mode"
+            "Run: cargo build --features insecure_mode"
         )
     return binary
 

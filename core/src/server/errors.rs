@@ -1,5 +1,5 @@
 use crate::server::ErrorResponse;
-use crate::shared::sops::SopsError;
+use crate::sops::SopsError;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -55,20 +55,57 @@ impl ServerError {
                     message: "Timeout while querying Docker API".to_string(),
                 })
             ).into_response(),
-            ServerError::Sops(SopsError::InvalidSecretFormat(msg)) => (
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse {
-                    error: "Invalid Secret".to_string(),
-                    message: msg,
-                })
-            ).into_response(),
-            ServerError::Sops(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "SOPS Error".to_string(),
-                    message: e.to_string(),
-                })
-            ).into_response(),
+            ServerError::Sops(e) => match e {
+                SopsError::InvalidSecretInput(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "Invalid Secret Input".to_string(),
+                        message: msg,
+                    })
+                ).into_response(),
+                SopsError::InvalidSecretData(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "Invalid Secret Data".to_string(),
+                        message: msg,
+                    })
+                ).into_response(),
+                SopsError::PermissionDenied(msg) => (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse {
+                        error: "Permission Denied".to_string(),
+                        message: msg,
+                    })
+                ).into_response(),
+                SopsError::NoSecretFound => (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: "Secret Not Found".to_string(),
+                        message: "No secret with the specified key was found".to_string(),
+                    })
+                ).into_response(),
+                SopsError::SecretAlreadyExists(msg) => (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: "Secret Already Exists".to_string(),
+                        message: msg,
+                    })
+                ).into_response(),
+                SopsError::Timeout(dur) | SopsError::LockTimeout(dur) => (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(ErrorResponse {
+                        error: "SOPS Timeout".to_string(),
+                        message: format!("Operation timed out after {:?}", dur),
+                    })
+                ).into_response(),
+                other => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "SOPS Error".to_string(),
+                        message: other.to_string(),
+                    })
+                ).into_response(),
+            },
             ServerError::SopsTimeout => (
                 StatusCode::REQUEST_TIMEOUT,
                 Json(ErrorResponse {
@@ -141,4 +178,4 @@ impl ServerError {
             ).into_response(),
         }
     }
-} 
+}

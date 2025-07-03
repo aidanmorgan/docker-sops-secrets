@@ -1,23 +1,25 @@
 use clap::{Parser, Subcommand};
 use sops_secrets::shared::logging;
-use sops_secrets::shared::sops::{SopsConfig, SopsError, SopsResult, SopsWrapper};
+use sops_secrets::sops::{SopsConfig, SopsError, SopsResult, SopsWrapper, SecretData};
 use std::collections::HashMap;
 use std::time::Duration;
+use serde_json;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "SOPS Secrets Manager CLI", long_about = None)]
 struct Args {
     /// Path to the SOPS file
     #[arg(short, long, default_value = "secrets.json")]
-    file: String,
+    file: PathBuf,
 
     /// Path to the master key file
     #[arg(short, long)]
-    master_key: String,
+    master_key: PathBuf,
 
     /// Path to the SOPS executable
     #[arg(long, default_value = "/usr/local/bin/sops")]
-    sops_path: String,
+    sops_path: PathBuf,
 
     /// Timeout for operations in seconds
     #[arg(long, default_value = "30")]
@@ -69,17 +71,6 @@ enum Commands {
         /// Allowed writers (comma-separated)
         #[arg(long)]
         writers: Option<String>,
-    },
-
-    /// Get an owned secret
-    GetOwned {
-        /// Owner name
-        #[arg(short, long)]
-        owner: String,
-
-        /// Secret name
-        #[arg(short, long)]
-        name: String,
     },
 
     /// Update a secret value
@@ -200,145 +191,236 @@ async fn main() {
 
     let args = Args::parse();
 
-    let config = SopsConfig {
-        sops_path: args.sops_path,
-        file_path: args.file,
-        master_key_path: args.master_key,
-        default_timeout: Duration::from_secs(args.timeout),
-        ..Default::default()
-    };
+    let config = SopsConfig::with_sops_path(args.file, args.master_key, args.sops_path)
+        .with_timeout(Duration::from_secs(args.timeout));
 
-    let sops = SopsWrapper::with_config(config);
+    let mut sops = SopsWrapper::with_config(config);
 
-    if let Err(e) = handle_commands(&sops, &args.command).await {
+    if let Err(e) = handle_commands(&mut sops, &args.command).await {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
 }
 
-async fn handle_commands(sops: &SopsWrapper, command: &Commands) -> SopsResult<()> {
+async fn handle_commands(sops: &mut SopsWrapper, command: &Commands) -> SopsResult<()> {
     match command {
         Commands::Init { secrets, owner } => {
-            println!("Initializing new SOPS file...");
-
+            println!("Initializing SOPS file with {} secrets for owner '{}'...", secrets.len(), owner);
+            
             let mut secrets_map = HashMap::new();
+            
             for secret_pair in secrets {
-                if let Some((key, value)) = secret_pair.split_once('=') {
-                    secrets_map.insert(key.to_string(), value.to_string());
-                } else {
-                    return Err(SopsError::InvalidSecretFormat(
-                        format!("Invalid secret format: {}", secret_pair)
+                let parts: Vec<&str> = secret_pair.splitn(2, '=').collect();
+                if parts.len() != 2 {
+                    return Err(SopsError::InvalidSecretInput(
+                        format!("Invalid secret format: {}. Expected key=value", secret_pair)
                     ));
                 }
+                let key = parts[0];
+                let value = parts[1];
+                
+                let secret_data = SecretData::new(
+                    value.to_string(),
+                    owner.to_string(),
+                    Some(vec![]),
+                    Some(vec![])
+                );
+                secrets_map.insert(key.to_string(), secret_data);
             }
-
-            sops.create_file(owner, &secrets_map, None).await?;
-            println!("✅ SOPS file initialized successfully");
+            
+            sops.update_secrets(&secrets_map, None).await?;
+            println!("✅ SOPS file initialized successfully with {} secrets", secrets.len());
         }
-
         Commands::Get { key } => {
             println!("Retrieving secret '{}'...", key);
-            let value = sops.get_secret(key, None).await?;
-            println!("{}", value);
+            let secret_data = sops.get_secret_data_for_key(key, None, None).await?;
+            println!("{}", secret_data.get_value());
         }
-
         Commands::AddOwned { owner, name, value, readers, writers } => {
             println!("Adding owned secret '{}' for owner '{}'...", name, owner);
 
-            let readers_vec = readers
-                .as_ref()
-                .map(|r| r.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+            let readers_vec: Vec<String> = readers.as_ref()
+                .map(|r| r.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
 
-            let writers_vec = writers
-                .as_ref()
-                .map(|w| w.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+            let writers_vec: Vec<String> = writers.as_ref()
+                .map(|w| w.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
 
-            sops.add_owned_secret(owner, name, value, &readers_vec, &writers_vec, None).await?;
+            let secret = if sops.key_exists(name, None, None).await? {
+                let mut secret_data = sops.get_secret_data_for_key(name, None, None).await?;
+
+                for x in readers_vec {
+                    secret_data.add_reader(x);
+                }
+                for x in writers_vec {
+                    secret_data.add_writer(x);
+                }
+
+                secret_data
+            }
+            else {
+                SecretData::new(value.to_string(), owner.to_string(), Some(readers_vec), Some(writers_vec))
+            };
+
+            let secrets_to_add = create_secrets_map(name, secret);
+            
+            sops.update_secrets(&secrets_to_add, None).await?;
             println!("✅ Owned secret '{}' added successfully", name);
         }
-
-        Commands::GetOwned { owner, name } => {
-            println!("Retrieving owned secret '{}' for owner '{}'...", name, owner);
-            let value = sops.get_owned_secret(owner, name, None).await?;
-            println!("{}", value);
-        }
-
         Commands::Update { name, value } => {
             println!("Updating secret '{}'...", name);
-            sops.update_secret_value(name, value, None).await?;
+
+            let mut secret_data = if sops.key_exists(name, None, None).await? {
+                sops.get_secret_data_for_key(name, None, None).await?
+            }
+            else {
+                eprintln!("Secret '{}' does not exist", name);
+                return Err(SopsError::NoSecretFound);
+            };
+
+            secret_data.set_value(value.to_string());
+            
+            let secrets_to_update = create_secrets_map(name, secret_data);
+            
+            sops.update_secrets(&secrets_to_update, None).await?;
             println!("✅ Secret '{}' updated successfully", name);
         }
-
         Commands::Access { subcommand } => {
             handle_access_commands(sops, subcommand).await?;
         }
-
         Commands::Validate => {
-            println!("Validating SOPS installation and configuration...");
+            println!("Validating SOPS installation...");
             sops.validate_sops(None).await?;
             println!("✅ SOPS validation successful");
         }
-
         Commands::Info { name } => {
             println!("Getting info for secret '{}'...", name);
-            let secret_data = sops.get_secret_data(name, None).await?;
-
+            let secret_data = sops.get_secret_data_for_key(name, None, None).await?;
             println!("Secret: {}", name);
             println!("Owner: {}", secret_data.owner);
             println!("Readers: {}", secret_data.readers.join(", "));
             println!("Writers: {}", secret_data.writers.join(", "));
         }
     }
-
     Ok(())
 }
 
-async fn handle_access_commands(sops: &SopsWrapper, command: &AccessCommands) -> SopsResult<()> {
+/// Helper function to create a secrets map with a single entry, avoiding unnecessary cloning
+fn create_secrets_map(name: &str, secret_data: SecretData) -> HashMap<String, SecretData> {
+    let mut map = HashMap::new();
+    map.insert(name.to_string(), secret_data);
+    map
+}
+
+async fn handle_access_commands(sops: &mut SopsWrapper, command: &AccessCommands) -> SopsResult<()> {
     match command {
         AccessCommands::GetReaders { secret } => {
-            let readers = sops.get_secret_readers(secret, None).await?;
-            println!("Readers for '{}': {}", secret, readers.join(", "));
+            println!("Getting readers for secret '{}'...", secret);
+            let secret_data = sops.get_secret_data_for_key(secret, None, None).await?;
+            println!("Readers: {}", secret_data.readers.join(", "));
         }
-
         AccessCommands::GetWriters { secret } => {
-            let writers = sops.get_secret_writers(secret, None).await?;
-            println!("Writers for '{}': {}", secret, writers.join(", "));
+            println!("Getting writers for secret '{}'...", secret);
+            let secret_data = sops.get_secret_data_for_key(secret, None, None).await?;
+            println!("Writers: {}", secret_data.writers.join(", "));
         }
+        AccessCommands::AddReader { secret: name, reader } => {
+            println!("Adding reader '{}' to secret '{}'...", reader, name);
 
-        AccessCommands::AddReader { secret, reader } => {
-            println!("Adding reader '{}' to secret '{}'...", reader, secret);
-            sops.add_reader_to_secret(secret, reader, None).await?;
+            let mut secret_data = if sops.key_exists(name, None, None).await? {
+                sops.get_secret_data_for_key(name, None, None).await?
+            }
+            else {
+                eprintln!("Secret '{}' does not exist", name);
+                return Err(SopsError::NoSecretFound)?
+            };
+
+            secret_data.add_reader(reader.to_string());
+
+            let secrets_to_update = create_secrets_map(name, secret_data);
+
+            sops.update_secrets(&secrets_to_update, None).await?;
             println!("✅ Reader '{}' added successfully", reader);
         }
+        AccessCommands::RemoveReader { secret: name, reader } => {
+            println!("Removing reader '{}' from secret '{}'...", reader, name);
 
-        AccessCommands::RemoveReader { secret, reader } => {
-            println!("Removing reader '{}' from secret '{}'...", reader, secret);
-            sops.remove_reader_from_secret(secret, reader, None).await?;
+            let mut secret_data = if sops.key_exists(name, None, None).await? {
+                sops.get_secret_data_for_key(name, None, None).await?
+            }
+            else {
+                eprintln!("Secret '{}' does not exist", name);
+                return Err(SopsError::NoSecretFound)?
+            };
+
+            secret_data.remove_reader(reader);
+
+            let secrets_to_update = create_secrets_map(name, secret_data);
+
+            sops.update_secrets(&secrets_to_update, None).await?;
+
             println!("✅ Reader '{}' removed successfully", reader);
         }
+        AccessCommands::AddWriter { secret: name, writer } => {
+            println!("Adding writer '{}' to secret '{}'...", writer, name);
 
-        AccessCommands::AddWriter { secret, writer } => {
-            println!("Adding writer '{}' to secret '{}'...", writer, secret);
-            sops.add_writer_to_secret(secret, writer, None).await?;
+            let mut secret_data = if sops.key_exists(name, None, None).await? {
+                sops.get_secret_data_for_key(name, None, None).await?
+            }
+            else {
+                eprintln!("Secret '{}' does not exist", name);
+                return Err(SopsError::NoSecretFound)?
+            };
+
+            secret_data.add_writer(writer.to_string());
+
+            let secrets_to_update = create_secrets_map(name, secret_data);
+
+            sops.update_secrets(&secrets_to_update, None).await?;
             println!("✅ Writer '{}' added successfully", writer);
         }
+        AccessCommands::RemoveWriter { secret: name, writer } => {
+            println!("Removing writer '{}' from secret '{}'...", writer, name);
 
-        AccessCommands::RemoveWriter { secret, writer } => {
-            println!("Removing writer '{}' from secret '{}'...", writer, secret);
-            sops.remove_writer_from_secret(secret, writer, None).await?;
+            let mut secret_data = if sops.key_exists(name, None, None).await? {
+                sops.get_secret_data_for_key(name, None, None).await?
+            }
+            else {
+                eprintln!("Secret '{}' does not exist", name);
+                return Err(SopsError::NoSecretFound)?
+            };
+
+            secret_data.remove_writer(writer);
+
+            let secrets_to_update = create_secrets_map(name, secret_data);
+
+            sops.update_secrets(&secrets_to_update, None).await?;
             println!("✅ Writer '{}' removed successfully", writer);
         }
+        AccessCommands::CanRead { secret: name, user } => {
+            let mut secret_data = if sops.key_exists(name, None, None).await? {
+                sops.get_secret_data_for_key(name, None, None).await?
+            }
+            else {
+                eprintln!("Secret '{}' does not exist", name);
+                return Err(SopsError::NoSecretFound)?
+            };
 
-        AccessCommands::CanRead { secret, user } => {
-            let can_read = sops.is_allowed_to_read("", secret, user, None).await?;
-            println!("User '{}' can read '{}': {}", user, secret, can_read);
+            let can_read = secret_data.can_read(user);
+            println!("User '{}' can read '{}': {}", user, name, can_read);
         }
+        AccessCommands::CanWrite { secret: name, user } => {
+            let mut secret_data = if sops.key_exists(name, None, None).await? {
+                sops.get_secret_data_for_key(name, None, None).await?
+            }
+            else {
+                eprintln!("Secret '{}' does not exist", name);
+                return Err(SopsError::NoSecretFound)?
+            };
 
-        AccessCommands::CanWrite { secret, user } => {
-            let can_write = sops.is_writer_allowed_to_write(secret, user, None).await?;
-            println!("User '{}' can write '{}': {}", user, secret, can_write);
+            let can_write = secret_data.can_write(user);
+            println!("User '{}' can write '{}': {}", user, name, can_write);
         }
     }
 

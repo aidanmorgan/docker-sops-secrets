@@ -2,15 +2,17 @@ use crate::server::{
     errors::ServerError,
     health::perform_health_checks,
     models::*,
-    secure_secret::SecureSecret,
     state::AppState,
     utils::*,
 };
-use crate::shared::age::{decrypt_with_age_private_key, generate_temp_age_key_pair, AgeError};
-use crate::shared::sops::SopsError;
+use crate::shared::age::{decrypt_with_age_private_key, encrypt_with_age_timeout, generate_temp_age_key_pair, is_valid_age_public_key, AgeError};
+use crate::sops::*;
+use crate::shared::secure_secret::{SecureSecret};
+use crate::server::docker::validate_docker_client_for_request;
+
 use axum::response::Response;
 use axum::{extract::{ConnectInfo, Path, State}, http::StatusCode, response::IntoResponse, Json, Router};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -18,15 +20,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-use zeroize::Zeroize;
-
+use std::time::Duration;
+use crate::shared::file_lock::FileLock;
 
 /// Health check endpoint
 pub async fn health_check(
     State(state): State<Arc<AppState>>,
 ) -> Response {
     info!("Health check endpoint called");
-    let timeout = std::time::Duration::from_secs(state.server_config.health_check_timeout_seconds);
+    let timeout = std::time::Duration::from_secs(state.server_config.health_check_timeout_seconds());
     debug!("Health check timeout: {:?}", timeout);
 
     // Perform health checks with timeout
@@ -38,16 +40,15 @@ pub async fn health_check(
                 sops_wrapper: false,
                 master_key: false,
                 docker_api: false,
-                age_executable: false,
                 secrets_directory: false,
                 sops_file: false,
             }
         });
 
     // Only fail if one of the critical checks is false
-    let status = checks.sops_wrapper && checks.age_executable && checks.docker_api && checks.secrets_directory;
-    debug!("Critical checks breakdown: sops_wrapper={}, age_executable={}, docker_api={}, secrets_directory={}", 
-              checks.sops_wrapper, checks.age_executable, checks.docker_api, checks.secrets_directory);
+    let status = checks.sops_wrapper && checks.docker_api && checks.secrets_directory;
+    debug!("Critical checks breakdown: sops_wrapper={}, docker_api={}, secrets_directory={}", 
+              checks.sops_wrapper, checks.docker_api, checks.secrets_directory);
 
     let timestamp = chrono::Utc::now().to_rfc3339();
     let response_status = if status { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR };
@@ -62,7 +63,7 @@ pub async fn health_check(
 }
 
 /// Get a secret by name with authorization and client encryption
-pub async fn get_secret(
+pub async fn get_secret_handler(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(secret_name): Path<String>,
@@ -87,8 +88,7 @@ pub async fn get_secret(
     }
 
     // Use DockerValidationOptions from server config
-    let validation_options = &state.server_config.docker_validation;
-
+    let validation_options = state.server_config.docker_validation();
     // Get client name from Docker
     let container_info = match validate_docker_client_for_request(&state.ip_cache, &state.docker_client, &client_ip, &headers, validation_options).await {
         Ok(info) => {
@@ -98,69 +98,49 @@ pub async fn get_secret(
         }
         Err(e) => {
             error!("Client validation failed for IP {}: {:?}", client_ip, e);
-            return e.into_response();
+            return ServerError::DockerApi(format!("Docker validation failed: {}", e)).into_response();
         }
     };
 
-    // Check authorization using the validated container image name (without version)
-    let is_authorized = match check_read_permission_with_timeout(&state.sops_client, &container_info.image_name_no_version, &secret_name, state.server_config.sops_timeout_seconds).await {
-        Ok(authorized) => {
-            debug!("Authorization check result: client='{}', secret='{}', authorized={}", container_info.image_name_no_version, secret_name, authorized);
-            authorized
+
+    // Get secret value using the public API (which now handles all validation and authorization)
+    let secret_value = match get_secret(
+        &state.sops_client, 
+        &secret_name, 
+        &container_info.image_name_no_version, 
+        Some(Duration::from_secs(state.server_config.sops_timeout_seconds()))
+    ).await {
+        Ok(secret) => {
+            debug!("Secret value retrieved successfully: secret='{}', value_length={}", secret_name, secret.expose_secret().len());
+            secret.expose_secret().to_string()
         }
         Err(e) => {
-            error!("Authorization check failed for client '{}' on secret '{}': {:?}", container_info.image_name_no_version, secret_name, e);
-            return e.into_response();
+            error!("Failed to get secret value for '{}': {:?}", secret_name, e);
+            return ServerError::Sops(e).into_response();
         }
     };
-
-    if !is_authorized {
-        warn!("Access denied: client '{}' not authorized to read secret '{}'", container_info.image_name_no_version, secret_name);
-        return ServerError::AccessDenied(
-            format!("Client '{}' is not authorized to read secret '{}'", container_info.image_name_no_version, secret_name)
-        ).into_response();
-    }
-
-    // Get secret data
-    let mut secret_data = match get_secret_data_with_timeout(&state.sops_client, &secret_name, state.server_config.sops_timeout_seconds).await {
-        Ok(data) => {
-            debug!("Secret data retrieved successfully: secret='{}', owner='{}'", secret_name, data.owner);
-            debug!("Secret metadata: readers_count={}, writers_count={}", data.readers.len(), data.writers.len());
-            data
-        }
-        Err(e) => {
-            error!("Failed to get secret data for '{}': {:?}", secret_name, e);
-            return e.into_response();
-        }
-    };
-
-    // Create a secure wrapper for the secret value
-    let secure_secret = SecureSecret::new(secret_data.value.clone());
-    let secret_value = secure_secret.expose_secret();
-    debug!("Secret value length: {}", secret_value.len());
 
     // Create secrets directory if it doesn't exist
-    if let Err(e) = fs::create_dir_all(&state.server_config.secrets_dir) {
-        error!("Failed to create secrets directory '{}': {}", state.server_config.secrets_dir, e);
+    if let Err(e) = fs::create_dir_all(state.server_config.secrets_dir()) {
+        error!("Failed to create secrets directory '{}': {}", state.server_config.secrets_dir().display(), e);
         return ServerError::FileSystem(format!("Failed to create secrets directory: {}", e))
             .into_response();
     }
 
     // Generate unique file name
     let file_name = format!("{}_{}.age", secret_name, Uuid::new_v4());
-    let file_path = PathBuf::from(&state.server_config.secrets_dir).join(&file_name);
+    let file_path = PathBuf::from(state.server_config.secrets_dir()).join(&file_name);
     debug!("Generated file path: {}", file_path.display());
 
     // Hash the data for security purposes
-    let file_hash = calculate_secret_hash(secret_value);
+    let file_hash = calculate_secret_hash(&secret_value);
     debug!("Generated file hash: {}", file_hash);
 
     // Encrypt secret with client's public key
     let encrypted_data = match encrypt_with_age_timeout(
-        &state.server_config.age_executable_path,
         &request.public_key,
-        secret_value,
-        state.server_config.age_timeout_seconds,
+        &secret_value,
+        state.server_config.age_timeout_seconds(),
     ).await {
         Ok(data) => {
             info!("Secret encrypted successfully, data length: {}", data.len());
@@ -206,23 +186,19 @@ pub async fn get_secret(
         }
     }
 
-    // Zero out the secret value from memory
-    (&mut secret_data.value).zeroize();
+    // Note: SecureSecret automatically zeroizes on drop
 
     // Schedule cleanup of the encrypted file for when the timeout occurs
-    let timeout_seconds = state.server_config.get_secret_file_cleanup_timeout;
-    let file_path_clone = file_path.clone();
-    let file_cleanup = state.file_cleanup.clone();
-    tokio::spawn(async move {
-        // Ensure the file path is absolute before adding to cleanup
-        if let Ok(abs_path) = file_path_clone.canonicalize() {
-            info!("Scheduling file cleanup: {} (timeout: {}s)", abs_path.display(), timeout_seconds);
-            file_cleanup.add_file(abs_path, std::time::Duration::from_secs(timeout_seconds)).await;
-        } else {
-            error!("Failed to canonicalize file path for cleanup: {}", file_path_clone.display());
-            eprintln!("⚠️  Failed to canonicalize file path for cleanup: {}", file_path_clone.display());
-        }
-    });
+    let timeout_seconds = state.server_config.get_secret_file_cleanup_timeout();
+    
+    // Avoid cloning by using reference to file_path
+    if let Ok(abs_path) = file_path.canonicalize() {
+        info!("Scheduling file cleanup: {} (timeout: {}s)", abs_path.display(), timeout_seconds);
+        state.file_cleanup.add_file(abs_path, Duration::from_secs(timeout_seconds)).await;
+    } else {
+        error!("Failed to canonicalize file path for cleanup: {}", file_path.display());
+        eprintln!("⚠️  Failed to canonicalize file path for cleanup: {}", file_path.display());
+    }
 
     info!("Get secret request completed successfully: secret='{}', file='{}'", secret_name, file_name);
 
@@ -235,8 +211,59 @@ pub async fn get_secret(
     )).into_response()
 }
 
+/// Helper function to validate write permissions for a secret
+async fn validate_write_permission(
+    sops_client: &SopsWrapper,
+    client_name: &str,
+    secret_name: &str,
+    timeout_seconds: u64,
+) -> Result<bool, ServerError> {
+    let timeout_duration = Some(Duration::from_secs(timeout_seconds));
+
+    // Check if secret exists first
+    let secret_exists = match secret_exists(sops_client, secret_name, timeout_duration).await {
+        Ok(exists) => {
+            if exists {
+                info!("Secret '{}' exists, checking write permission", secret_name);
+            } else {
+                info!("Secret '{}' does not exist, allowing creation", secret_name);
+            }
+            exists
+        }
+        Err(e) => {
+            warn!("Failed to check if secret '{}' exists: {:?}", secret_name, e);
+            return Err(ServerError::Sops(e));
+        }
+    };
+
+    // Only check write permission if the secret already exists
+    if secret_exists {
+        let can_write = match can_write(sops_client, client_name, secret_name, timeout_duration).await {
+            Ok(can_write) => {
+                info!("Write permission check result: client='{}', secret='{}', can_write={}", client_name, secret_name, can_write);
+                can_write
+            }
+            Err(e) => {
+                warn!("Write permission check failed for client '{}' on secret '{}': {:?}", client_name, secret_name, e);
+                return Err(ServerError::Sops(e));
+            }
+        };
+
+        if !can_write {
+            warn!("Access denied: client '{}' not authorized to write secret '{}'", client_name, secret_name);
+            return Err(ServerError::AccessDenied(
+                format!("Client '{}' is not authorized to write secret '{}'", client_name, secret_name)
+            ));
+        }
+    } else {
+        info!("Allowing client '{}' to create new secret '{}'", client_name, secret_name);
+    }
+
+    Ok(true)
+}
+
 /// Write secret initiation endpoint
-pub async fn write_secret_init(
+pub async fn write_secret_init_handler(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(_secret_name): Path<String>,
@@ -254,7 +281,7 @@ pub async fn write_secret_init(
     }
 
     // Use DockerValidationOptions from server config
-    let validation_options = &state.server_config.docker_validation;
+    let validation_options = state.server_config.docker_validation();
 
     // Get client name from Docker with enhanced validation (including header support for testing)
     let container_info = match validate_docker_client_for_request(&state.ip_cache, &state.docker_client, &client_ip, &headers, validation_options).await {
@@ -264,51 +291,22 @@ pub async fn write_secret_init(
         }
         Err(e) => {
             warn!("Client validation failed for IP {}: {:?}", client_ip, e);
-            return e.into_response();
+            return ServerError::DockerApi(format!("Docker validation failed: {}", e)).into_response();
         }
     };
 
-    // Check if secret exists first using a more efficient method
-    let secret_exists = match check_secret_exists_with_timeout(&state.sops_client, &request.secret_name, state.server_config.sops_timeout_seconds).await {
-        Ok(exists) => {
-            if exists {
-                info!("Secret '{}' exists, checking write permission", request.secret_name);
-            } else {
-                info!("Secret '{}' does not exist, allowing creation", request.secret_name);
-            }
-            exists
-        }
-        Err(e) => {
-            warn!("Failed to check if secret '{}' exists: {:?}", request.secret_name, e);
-            return e.into_response();
-        }
-    };
 
-    // Only check write permission if the secret already exists
-    if secret_exists {
-        let can_write = match check_write_permission_with_timeout(&state.sops_client, &container_info.image_name_no_version, &request.secret_name, state.server_config.sops_timeout_seconds).await {
-            Ok(can_write) => {
-                info!("Write permission check result: client='{}', secret='{}', can_write={}", container_info.image_name_no_version, request.secret_name, can_write);
-                can_write
-            }
-            Err(e) => {
-                warn!("Write permission check failed for client '{}' on secret '{}': {:?}", container_info.image_name_no_version, request.secret_name, e);
-                return e.into_response();
-            }
-        };
-
-        if !can_write {
-            warn!("Access denied: client '{}' not authorized to write secret '{}'", container_info.image_name_no_version, request.secret_name);
-            return ServerError::AccessDenied(
-                format!("Client '{}' is not authorized to write secret '{}'", container_info.image_name_no_version, request.secret_name)
-            ).into_response();
-        }
-    } else {
-        info!("Allowing client '{}' to create new secret '{}'", container_info.image_name_no_version, request.secret_name);
+    if let Err(e) = validate_write_permission(
+        &state.sops_client,
+        &container_info.image_name_no_version,
+        &request.secret_name,
+        state.server_config.sops_timeout_seconds(),
+    ).await {
+        return e.into_response();
     }
 
     // Generate temporary age key pair
-    let temp_key_pair = match generate_temp_age_key_pair(std::time::Duration::from_secs(state.server_config.age_timeout_seconds)).await {
+    let temp_key_pair = match generate_temp_age_key_pair(std::time::Duration::from_secs(state.server_config.age_timeout_seconds())).await {
         Ok(key_pair) => {
             info!("Generated temporary age key pair successfully");
             key_pair
@@ -324,8 +322,8 @@ pub async fn write_secret_init(
     };
 
     // Create secrets directory if it doesn't exist
-    if let Err(e) = fs::create_dir_all(&state.server_config.secrets_dir) {
-        error!("Failed to create secrets directory '{}': {}", state.server_config.secrets_dir, e);
+    if let Err(e) = fs::create_dir_all(state.server_config.secrets_dir()) {
+        error!("Failed to create secrets directory '{}': {}", state.server_config.secrets_dir().display(), e);
         return ServerError::FileSystem(format!("Failed to create secrets directory: {}", e)).into_response();
     }
 
@@ -341,11 +339,11 @@ pub async fn write_secret_init(
 
     // Store the write operation
     let write_op = WriteOperation {
-        secret_name: request.secret_name.clone(),
+        secret_name: request.secret_name.to_string(),
         client_ip,
-        public_key: temp_key_pair.public_key.clone(),
-        private_key: temp_key_pair.private_key.clone(),
-        secret_hash: request.secret_hash.clone(),
+        public_key: temp_key_pair.public_key.to_string(),
+        private_key: temp_key_pair.private_key.to_string(),
+        secret_hash: request.secret_hash.to_string(),
         file_path: format!("{}.age", operation_id),
         expires_at,
     };
@@ -357,14 +355,14 @@ pub async fn write_secret_init(
 
     // Return the temporary public key and operation ID
     Json(WriteSecretInitResponse {
-        public_key: temp_key_pair.public_key.clone(),
+        public_key: temp_key_pair.public_key.to_string(),
         file_path: format!("{}.age", operation_id),
         expires_at: expires_at.to_string(),
     }).into_response()
 }
 
 /// Write secret completion endpoint
-pub async fn write_secret_complete(
+pub async fn write_secret_complete_handler(
     State(state): State<Arc<AppState>>,
     Path(secret_name): Path<String>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -381,8 +379,7 @@ pub async fn write_secret_complete(
     }
 
     // Use DockerValidationOptions from server config
-    let validation_options = &state.server_config.docker_validation;
-
+    let validation_options = state.server_config.docker_validation();
     // Get client name from Docker with enhanced validation (including header support for testing)
     let container_info = match validate_docker_client_for_request(&state.ip_cache, &state.docker_client, &client_ip, &headers, validation_options).await {
         Ok(info) => {
@@ -391,64 +388,20 @@ pub async fn write_secret_complete(
         }
         Err(e) => {
             warn!("Client validation failed for IP {}: {:?}", client_ip, e);
-            return e.into_response();
+            return ServerError::DockerApi(format!("Docker validation failed: {}", e)).into_response();
         }
     };
-
-    // Check if secret exists first using a more efficient method
-    let secret_exists = match check_secret_exists_with_timeout(&state.sops_client, &secret_name, state.server_config.sops_timeout_seconds).await {
-        Ok(exists) => {
-            if exists {
-                info!("Secret '{}' exists, checking write permission", secret_name);
-            } else {
-                info!("Secret '{}' does not exist, allowing creation", secret_name);
-            }
-            exists
-        }
-        Err(e) => {
-            warn!("Failed to check if secret '{}' exists: {:?}", secret_name, e);
-            return e.into_response();
-        }
-    };
-
-    // Only check write permission if the secret already exists
-    if secret_exists {
-        let can_write = match check_write_permission_with_timeout(&state.sops_client, &container_info.image_name_no_version, &secret_name, state.server_config.sops_timeout_seconds).await {
-            Ok(can_write) => {
-                info!("Write permission check result: client='{}', secret='{}', can_write={}", container_info.image_name_no_version, secret_name, can_write);
-                can_write
-            }
-            Err(e) => {
-                warn!("Write permission check failed for client '{}' on secret '{}': {:?}", container_info.image_name_no_version, secret_name, e);
-                return e.into_response();
-            }
-        };
-
-        if !can_write {
-            warn!("Access denied: client '{}' not authorized to write secret '{}'", container_info.image_name_no_version, secret_name);
-            return ServerError::AccessDenied(
-                format!("Client '{}' is not authorized to write secret '{}'", container_info.image_name_no_version, secret_name)
-            ).into_response();
-        }
-    } else {
-        info!("Allowing client '{}' to create new secret '{}'", container_info.image_name_no_version, secret_name);
-    }
 
     // Find the write operation for this client and secret
-    let operation_cache = {
-        let write_ops = state.write_operations.read().await;
+    let operation_key = format!("{}:{}", container_info.image_name_no_version, secret_name);
+    let write_ops = state.write_operations.read().await;
 
-        write_ops.iter()
-            .find(|x| x.1.secret_name == secret_name && x.1.client_ip == client_ip)
-            .map(|(_, op)| op.clone())
-    };
-
-    if operation_cache.is_none() {
+    if !write_ops.contains_key(&operation_key) {
         warn!("Write operation not found: no active operation for client '{}' and secret '{}'", container_info.image_name_no_version, secret_name);
         return ServerError::WriteOperationNotFound.into_response();
     }
 
-    let operation = operation_cache.unwrap();
+    let operation = write_ops.get(&operation_key).unwrap();
     info!("Found write operation: secret='{}', client='{}', expires_at={}", operation.secret_name, container_info.image_name_no_version, operation.expires_at);
 
     // Check if operation has expired
@@ -463,29 +416,54 @@ pub async fn write_secret_complete(
     }
 
     // Read the encrypted file
-    let encrypted_file_path = PathBuf::from(&state.server_config.secrets_dir).join(&operation.file_path);
-
-    let encrypted_data = match encrypted_file_path.canonicalize() {
-        Ok(path) => {
-            info!("Reading encrypted file: {}", path.display());
-            match tokio::fs::read(&path).await {
-                Ok(data) => {
-                    info!("Encrypted file read successfully, data length: {}", data.len());
-                    data
+    let encrypted_file_path = PathBuf::from(state.server_config.secrets_dir()).join(&operation.file_path);
+    let encrypted_data = if encrypted_file_path.exists() {
+        // Try to canonicalize if file exists
+        match encrypted_file_path.canonicalize() {
+            Ok(path) => {
+                info!("Reading encrypted file: {}", path.display());
+                
+                match tokio::fs::read(&path).await {
+                    Ok(data) => {
+                        info!("Encrypted file read successfully, data length: {}", data.len());
+                        data
+                    }
+                    Err(e) => {
+                        warn!("Failed to read encrypted file '{}': {}", path.display(), e);
+                        return ServerError::FileSystem(format!("Failed to read encrypted file: {}", e)).into_response();
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to read encrypted file '{}': {}", path.display(), e);
-                    return ServerError::FileSystem(format!("Failed to read encrypted file: {}", e)).into_response();
+            }
+            Err(e) => {
+                warn!("Failed to canonicalize file path '{}': {}, trying original path", encrypted_file_path.display(), e);
+                // Fall back to reading the original path
+                match tokio::fs::read(&encrypted_file_path).await {
+                    Ok(data) => {
+                        info!("Encrypted file read successfully using original path, data length: {}", data.len());
+                        data
+                    }
+                    Err(e) => {
+                        warn!("Failed to read encrypted file '{}': {}", encrypted_file_path.display(), e);
+                        return ServerError::FileSystem(format!("Failed to read encrypted file: {}", e)).into_response();
+                    }
                 }
             }
         }
-        Err(e) => {
-            warn!("Failed to generate file path for '{}': {}", operation.file_path, e);
-            return ServerError::FileSystem(format!("Failed to generate file path: {}", e)).into_response();
+    } else {
+        // File doesn't exist, try to read it anyway (might be a symlink or other issue)
+        match tokio::fs::read(&encrypted_file_path).await {
+            Ok(data) => {
+                info!("Encrypted file read successfully, data length: {}", data.len());
+                data
+            }
+            Err(e) => {
+                warn!("Failed to read encrypted file '{}': {}", encrypted_file_path.display(), e);
+                return ServerError::FileSystem(format!("Failed to read encrypted file: {}", e)).into_response();
+            }
         }
     };
 
-    let decrypted_secret = match decrypt_with_age_private_key(&operation.private_key, &encrypted_data, std::time::Duration::from_secs(state.server_config.age_timeout_seconds)).await {
+    let decrypted_secret = match decrypt_with_age_private_key(&operation.private_key, &encrypted_data, Duration::from_secs(state.server_config.age_timeout_seconds())).await {
         Ok(secret) => {
             info!("Secret decrypted successfully, length: {}", secret.len());
             secret
@@ -511,36 +489,39 @@ pub async fn write_secret_complete(
 
     info!("Hash validation passed");
 
-    // Add or update the secret
-    let result: Result<(), ServerError> = if secret_exists {
-        info!("Updating existing secret: '{}'", secret_name);
-        // Update existing secret
-        update_secret_with_timeout(&state.sops_client, &secret_name, secure_secret.expose_secret(), state.server_config.sops_timeout_seconds).await
-    } else {
-        info!("Creating new secret: '{}' with owner '{}'", secret_name, container_info.image_name_no_version);
-        // Create new secret with client as owner
-        create_secret_with_timeout(&state.sops_client, &container_info.image_name_no_version, &secret_name, secure_secret.expose_secret(), state.server_config.sops_timeout_seconds).await
+    // Use the enhanced set_secret function that handles all authorization internally
+    // First check if secret exists to determine operation type
+    let secret_exists = match secret_exists(&state.sops_client, &secret_name, Some(Duration::from_secs(state.server_config.sops_timeout_seconds()))).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            warn!("Failed to check if secret exists: {:?}", e);
+            // Assume it doesn't exist if we can't check
+            return ServerError::Sops(e).into_response();
+        }
     };
 
-    // Secure secret is automatically zeroized when dropped
-
+    let result = set_secret(
+        &state.sops_client,
+        &secret_name,
+        secure_secret.expose_secret(),
+        &container_info.image_name_no_version,
+        Some(Duration::from_secs(state.server_config.sops_timeout_seconds()))
+    ).await;
+    
     match result {
         Ok(_) => {
-            info!("Write secret completion successful: secret='{}', operation='{}'", secret_name, if secret_exists { "update" } else { "create" });
+            let operation_type = if secret_exists { "updated" } else { "created" };
+            info!("Write secret completion successful: secret='{}' ({})", secret_name, operation_type);
             (StatusCode::OK, Json(
                 WriteSecretCompleteResponse {
-                    status: "success".to_string(),
-                    message: if secret_exists {
-                        "updated".to_string()
-                    } else {
-                        "created".to_string()
-                    },
+                    status: operation_type.to_string(),
+                    message: operation_type.to_string(),
                 }
             )).into_response()
         }
         Err(e) => {
             warn!("Write secret completion failed: secret='{}', error={:?}", secret_name, e);
-            e.into_response()
+            ServerError::Sops(e).into_response()
         }
     }
 }
@@ -549,9 +530,9 @@ pub async fn write_secret_complete(
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", axum::routing::get(health_check))
-        .route("/secret/{secret_name}", axum::routing::post(get_secret))
-        .route("/secret/{secret_name}/write/init", axum::routing::post(write_secret_init))
-        .route("/secret/{secret_name}/write/complete", axum::routing::post(write_secret_complete))
+        .route("/secret/{secret_name}", axum::routing::post(get_secret_handler))
+        .route("/secret/{secret_name}/write/init", axum::routing::post(write_secret_init_handler))
+        .route("/secret/{secret_name}/write/complete", axum::routing::post(write_secret_complete_handler))
         .with_state(state)
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1MB limit
-} 
+}

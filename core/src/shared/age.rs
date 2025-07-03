@@ -5,9 +5,16 @@ use age::{Decryptor, Encryptor};
 use log::{debug, error, info, warn};
 use std::io::{Read, Write};
 use std::time::Duration;
+use lazy_static::lazy_static;
+use regex::Regex;
 use thiserror::Error;
 use tokio::time::timeout;
 use zeroize::Zeroize;
+
+lazy_static! {
+    static ref AGE_PUBLIC_KEY_REGEX: Regex = Regex::new(r"^age1[a-z0-9]{58}$").unwrap();
+}
+
 
 #[derive(Debug, Error)]
 pub enum AgeError {
@@ -133,6 +140,48 @@ pub async fn encrypt_with_age_public_key(
     // Run the operation with a timeout
     execute_with_timeout(timeout_duration, operation, "encryption").await
 }
+
+
+/// Encrypt data with age using timeout
+pub async fn encrypt_with_age_timeout(
+    public_key: &str,
+    data: &str,
+    timeout_seconds: u64,
+) -> Result<Vec<u8>, crate::server::errors::ServerError> {
+    debug!("Encrypting data with age: public_key_length={}, data_length={}, timeout={}s", public_key.len(), data.len(), timeout_seconds);
+
+    let age_timeout = Duration::from_secs(timeout_seconds);
+    let public_key = public_key.to_string();
+    let data = data.to_string();
+
+    let result = tokio::time::timeout(
+        age_timeout,
+        encrypt_with_age_public_key(&public_key, &data, age_timeout),
+    )
+        .await
+        .map_err(|_| {
+            warn!("Age encryption timed out after {:?}", age_timeout);
+            crate::server::errors::ServerError::AgeTimeout
+        })?
+        .map_err(|e| {
+            error!("Age encryption failed: {:?}", e);
+            crate::server::errors::ServerError::AgeEncryption(format!("Encryption error: {}", e))
+        });
+
+    match &result {
+        Ok(encrypted_data) => { info!("Age encryption successful, encrypted data length: {}", encrypted_data.len()); }
+        Err(e) => { error!("Age encryption failed: {:?}", e); }
+    }
+
+    result
+}
+
+/// Validate age public key format
+pub fn is_valid_age_public_key(public_key: &str) -> bool {
+    AGE_PUBLIC_KEY_REGEX.is_match(public_key)
+}
+
+
 
 /// Helper function to execute an operation with timeout
 async fn execute_with_timeout<T, F>(timeout_duration: Duration, operation: F, operation_name: &str) 

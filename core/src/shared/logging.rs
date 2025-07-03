@@ -16,6 +16,8 @@ impl Log for InsecureLogger {
         metadata.level() <= self.level
     }
 
+    #[allow(dead_code)]
+    // disbling the linter here, depending on which flag is used different variables are used
     fn log(&self, record: &Record) {
         // this isn't strictly required as the default implementation of `enabled` already
         // does this check, but I'm being paranoid and just making doubly sure it doesn't happen.
@@ -34,7 +36,7 @@ impl Log for InsecureLogger {
             }
         }
 
-        #[cfg(not(feature = "insecure_mode"))]
+        #[cfg(feature = "secure_mode")]
         {
             // we only allow errors to be logged in secure mode.
             if record.level() == LevelFilter::Error {
@@ -48,6 +50,11 @@ impl Log for InsecureLogger {
                     record.args()
                 );
             }
+        }
+
+        #[cfg(not(any(feature = "secure_mode", feature = "insecure_mode")))]
+        {
+            panic!("Code must be built with either secure or insecure mode.")
         }
     }
 
@@ -70,4 +77,4 @@ pub fn init_logger() {
         // In secure mode, dont log anything!
         log::set_max_level(LevelFilter::Error);
     }
-} 
+}

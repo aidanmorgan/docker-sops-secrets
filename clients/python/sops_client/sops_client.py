@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Union, Tuple, List
 import urllib.parse
+import tempfile
 
 import aiohttp
 import aiofiles
@@ -110,11 +111,11 @@ class SopsClient:
             self.session = None
     
     def _get_headers(self) -> Dict[str, str]:
-        """Get headers for requests, including X-Client-Name for local mode."""
+        """Get headers for requests, including X-Docker-ImageName for local mode."""
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "X-Client-Name": self.client_name,
+            "X-Docker-ImageName": self.client_name,
         }
         return headers
     
@@ -330,26 +331,38 @@ class SopsClient:
         Decrypt data using age.
         
         Args:
-            encrypted_data: Encrypted data to decrypt
-            private_key: Private key to decrypt with
+            encrypted_data: Data to decrypt
+            private_key: Age private key to decrypt with
             
         Returns:
             Decrypted data
         """
-        # Use age to decrypt with private key provided as --identity argument
-        process = await asyncio.create_subprocess_exec(
-            self.age_path, '--decrypt', '--identity', private_key,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        # Write private key to a temporary file
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.age') as temp_file:
+            temp_file.write(private_key)
+            temp_file_path = temp_file.name
         
-        stdout, stderr = await process.communicate(input=encrypted_data)
-        
-        if process.returncode != 0:
-            raise SopsClientSecretError(f"Age decryption failed: {stderr.decode()}")
-        
-        return stdout
+        try:
+            # Use age to decrypt with private key from temporary file
+            process = await asyncio.create_subprocess_exec(
+                self.age_path, '--decrypt', '--identity', temp_file_path,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate(input=encrypted_data)
+            
+            if process.returncode != 0:
+                raise SopsClientSecretError(f"Age decryption failed: {stderr.decode()}")
+            
+            return stdout
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(temp_file_path)
+            except OSError:
+                pass  # Ignore cleanup errors
     
     async def create_secret(self, secret_name: str, secret_value: str) -> str:
         """
@@ -511,7 +524,7 @@ async def get_secret(
     base_directory: str = "/var/tmp/sops-secrets",
     age_keygen_path: str = "/usr/local/bin/age-keygen",
     age_path: str = "/usr/local/bin/age",
-    client_name: str = "default-client"
+    docker_image_name: str = "default-image"
 ) -> str:
     """
     Convenience function to get a secret.
@@ -532,7 +545,7 @@ async def get_secret(
         base_directory=base_directory,
         age_keygen_path=age_keygen_path,
         age_path=age_path,
-        client_name=client_name
+        client_name=docker_image_name
     ) as client:
         return await client.get_secret(secret_name)
 
@@ -544,7 +557,7 @@ async def set_secret(
     base_directory: str = "/var/tmp/sops-secrets",
     age_keygen_path: str = "/usr/local/bin/age-keygen",
     age_path: str = "/usr/local/bin/age",
-    client_name: str = "default-client"
+    docker_image_name: str = "default-image"
 ) -> str:
     """
     Convenience function to set a secret.
@@ -566,7 +579,7 @@ async def set_secret(
         base_directory=base_directory,
         age_keygen_path=age_keygen_path,
         age_path=age_path,
-        client_name=client_name
+        client_name=docker_image_name
     ) as client:
         return await client.set_secret(secret_name, secret_value)
 

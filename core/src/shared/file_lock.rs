@@ -1,7 +1,7 @@
 use log::{debug, error, info, trace, warn};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::time::sleep;
@@ -39,32 +39,32 @@ pub struct FileLock {
 impl FileLock {
     /// Try to acquire a read lock on the specified file
     pub async fn acquire_read_lock(
-        file_path: &str,
+        file_path: &PathBuf,
         timeout: Duration,
     ) -> FileLockResult<Self> {
-        info!("Attempting to acquire read lock for file: {}", file_path);
+        info!("Attempting to acquire read lock for file: {}", canonical_display(file_path));
         debug!("Read lock timeout set to: {:?}", timeout);
         Self::acquire_lock(file_path, false, timeout).await
     }
 
     /// Try to acquire a write lock on the specified file
     pub async fn acquire_write_lock(
-        file_path: &str,
+        file_path: &PathBuf,
         timeout: Duration,
     ) -> FileLockResult<Self> {
-        info!("FileLock: Attempting to acquire write lock for file: {}", file_path);
+        info!("FileLock: Attempting to acquire write lock for file: {}", canonical_display(file_path));
         debug!("FileLock: Write lock timeout set to: {:?}", timeout);
         Self::acquire_lock(file_path, true, timeout).await
     }
 
     /// Internal method to acquire either a read or write lock
     async fn acquire_lock(
-        file_path: &str,
+        file_path: &PathBuf,
         is_write_lock: bool,
         timeout: Duration,
     ) -> FileLockResult<Self> {
         debug!("FileLock: Starting lock acquisition - type: {}, file: {}", 
-                 if is_write_lock { "write" } else { "read" }, file_path);
+                 if is_write_lock { "write" } else { "read" }, canonical_display(file_path));
 
         let file_dir = Path::new(file_path).parent().unwrap_or_else(|| Path::new("."));
         let pid = std::process::id();
@@ -170,20 +170,19 @@ impl FileLock {
     }
 
     /// Get the write lock file path
-    fn get_write_lock_path(file_path: &str) -> String {
+    fn get_write_lock_path(file_path: &PathBuf) -> String {
         Self::get_lock_path(file_path, "write.lock", None)
     }
 
     /// Get the read lock file path for this PID
-    fn get_read_lock_path(file_path: &str, pid: u32) -> String {
+    fn get_read_lock_path(file_path: &PathBuf, pid: u32) -> String {
         Self::get_lock_path(file_path, "read.lock", Some(pid))
     }
 
     /// Common helper for generating lock file paths
-    fn get_lock_path(file_path: &str, suffix: &str, pid: Option<u32>) -> String {
-        let path = Path::new(file_path);
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let filename = path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("unknown"));
+    fn get_lock_path(file_path: &PathBuf, suffix: &str, pid: Option<u32>) -> String {
+        let parent = file_path.parent().unwrap_or_else(|| Path::new("."));
+        let filename = file_path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("unknown"));
 
         let lock_name = match pid {
             Some(pid) => format!("{}.{}.{}", filename.to_string_lossy(), suffix, pid),
@@ -268,8 +267,8 @@ pub struct ReadLock(FileLock);
 
 impl ReadLock {
     /// Acquire a read lock
-    pub async fn acquire(file_path: &str, timeout: Duration) -> FileLockResult<Self> {
-        info!("ReadLock: Acquiring read lock for file: {}", file_path);
+    pub async fn acquire(file_path: &PathBuf, timeout: Duration) -> FileLockResult<Self> {
+        info!("ReadLock: Acquiring read lock for file: {}", canonical_display(file_path));
         FileLock::acquire_read_lock(file_path, timeout)
             .await
             .map(ReadLock)
@@ -288,8 +287,8 @@ pub struct WriteLock(FileLock);
 
 impl WriteLock {
     /// Acquire a write lock
-    pub async fn acquire(file_path: &str, timeout: Duration) -> FileLockResult<Self> {
-        info!("WriteLock: Acquiring write lock for file: {}", file_path);
+    pub async fn acquire(file_path: &PathBuf, timeout: Duration) -> FileLockResult<Self> {
+        info!("WriteLock: Acquiring write lock for file: {}", canonical_display(file_path));
         FileLock::acquire_write_lock(file_path, timeout)
             .await
             .map(WriteLock)
@@ -301,4 +300,9 @@ impl Drop for WriteLock {
         info!("WriteLock: Dropping write lock");
         // FileLock's Drop implementation will handle cleanup automatically
     }
+}
+
+// Helper for canonicalized display
+fn canonical_display(path: &std::path::PathBuf) -> String {
+    path.canonicalize().map(|p| p.display().to_string()).unwrap_or_else(|_| path.display().to_string())
 }

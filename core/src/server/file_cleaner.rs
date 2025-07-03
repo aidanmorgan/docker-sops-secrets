@@ -104,8 +104,9 @@ impl FileCleanupManager {
     }
 
     pub fn spawn_background_task(self: Arc<Self>) {
-        let queue = self.queue.clone();
-        let notify = self.notify.clone();
+        // Clone the Arc fields before moving into async block
+        let queue = Arc::clone(&self.queue);
+        let notify = Arc::clone(&self.notify);
         let max_retries = self.max_retries;
         let retry_delay = self.retry_delay;
 
@@ -133,7 +134,7 @@ impl FileCleanupManager {
                 let mut queue = queue.lock().await;
                 let now = Instant::now();
 
-                while let Some(file) = queue.peek().cloned() {
+                while let Some(file) = queue.peek() {
                     if file.expires_at <= now {
                         let file = queue.pop().ok_or("Queue unexpectedly empty")?;
 
@@ -154,10 +155,12 @@ impl FileCleanupManager {
                                 if file.retries + 1 >= max_retries {
                                     eprintln!("Max retries exceeded for file: {}", file.path.display());
                                 } else {
-                                    // Schedule retry
-                                    let mut retry_file = file.clone();
-                                    retry_file.retries += 1;
-                                    retry_file.expires_at = now + retry_delay;
+                                    // Schedule retry - avoid cloning by creating new struct
+                                    let retry_file = ExpiringFile {
+                                        path: file.path.clone(),
+                                        retries: file.retries + 1,
+                                        expires_at: now + retry_delay,
+                                    };
                                     to_retry.push(retry_file);
                                 }
                             }
@@ -194,18 +197,15 @@ impl FileCleanupManager {
     }
 
     /// Helper to mark a file as managed by the file cleaner (set xattr with expiry time)
-    pub fn mark_file_managed(path: &PathBuf, expires_at: Instant) {
-        // Calculate expiry as UNIX timestamp (seconds since epoch)
-        let now = Instant::now();
-        let duration_until_expiry = expires_at.duration_since(now);
-        let expiry_time = Utc::now() + chrono::Duration::from_std(duration_until_expiry)
-            .unwrap_or_else(|_| chrono::Duration::seconds(0));
+    pub fn mark_file_managed(path: &PathBuf, expires_after: Duration) {
+        let expiry_time = Utc::now() +expires_after;
         let expiry_timestamp = expiry_time.timestamp().to_string();
 
         // Set both the managed flag and expiry time
         if let Err(e) = set(path, "user.sops_cleaner_managed", b"1") {
             eprintln!("Failed to set managed flag xattr on {}: {}", path.display(), e);
         }
+
         if let Err(e) = set(path, "user.sops_cleaner_expires", expiry_timestamp.as_bytes()) {
             eprintln!("Failed to set expiry xattr on {}: {}", path.display(), e);
         }
@@ -290,10 +290,10 @@ impl FileCleanupManager {
             return;
         }
 
-        let expires_at = Instant::now() + expires_in;
-
         // Mark the file as managed by the file cleaner with expiry time
-        Self::mark_file_managed(&path, expires_at);
+        Self::mark_file_managed(&path, expires_in);
+
+        let expires_at = Instant::now() + expires_in;
 
         let mut queue = self.queue.lock().await;
         queue.push(ExpiringFile { path, expires_at, retries: 0 });

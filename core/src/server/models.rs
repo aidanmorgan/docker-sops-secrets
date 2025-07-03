@@ -93,7 +93,6 @@ pub struct HealthChecks {
     pub sops_wrapper: bool,
     pub master_key: bool,
     pub docker_api: bool,
-    pub age_executable: bool,
     pub secrets_directory: bool,
     pub sops_file: bool,
 } 

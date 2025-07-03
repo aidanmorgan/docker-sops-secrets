@@ -1,10 +1,14 @@
-use bollard::query_parameters::{InspectContainerOptionsBuilder, ListContainersOptionsBuilder};
-use bollard::Docker;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use thiserror::Error;
 use tokio::sync::RwLock;
+use log::{debug, error, info, warn};
+use chrono::Utc;
+
+use bollard::query_parameters::{InspectContainerOptionsBuilder, ListContainersOptionsBuilder};
+use bollard::Docker;
+
+use thiserror::Error;
 
 // Import the test_log macro from crate root
 
@@ -66,7 +70,8 @@ pub fn create_container_cache() -> ContainerCache {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
-/// Enhanced container validation with multiple security checks
+/// Enhanced container validatio
+/// n with multiple security checks
 async fn validate_container_security(
     docker_client: &Docker,
     client_ip: &String,
@@ -74,78 +79,78 @@ async fn validate_container_security(
     list_options: Option<ListContainersOptionsBuilder>,
     inspect_options: Option<InspectContainerOptionsBuilder>,
 ) -> Result<ContainerInfo, DockerError> {
-    log::info!("Starting container security validation for IP: {}", client_ip);
-    log::info!("Network filter: {:?}", network_name);
+    info!("Starting container security validation for IP: {}", client_ip);
+    info!("Network filter: {:?}", network_name);
 
     // Validate IP address format
-    log::info!("Validating IP address format: {}", client_ip);
+    info!("Validating IP address format: {}", client_ip);
     let _parsed_ip: IpAddr = client_ip.parse()
         .map_err(|e| {
-            log::info!("Invalid IP address format: {}", e);
+            info!("Invalid IP address format: {}", e);
             DockerError::InvalidIpAddress(format!("Failed to parse IP {}: {}", client_ip, e))
         })?;
-    log::info!("IP address format is valid");
+    info!("IP address format is valid");
 
     // Query Docker API for all containers
-    log::info!("Querying Docker API for containers...");
+    info!("Querying Docker API for containers...");
     let containers = match docker_client.list_containers(
         list_options.map(|o| o.build()).or(Some(ListContainersOptionsBuilder::new().all(true).build()))
     ).await {
         Ok(containers) => {
-            log::info!("Successfully retrieved {} containers from Docker API", containers.len());
+            info!("Successfully retrieved {} containers from Docker API", containers.len());
             containers
         }
         Err(e) => {
-            log::info!("Failed to list containers from Docker API: {}", e);
+            info!("Failed to list containers from Docker API: {}", e);
             return Err(DockerError::DockerApi(e));
         }
     };
 
-    log::info!("Searching for container with IP: {}", client_ip);
+    info!("Searching for container with IP: {}", client_ip);
     for (i, container) in containers.iter().enumerate() {
-        log::info!("Checking container {}: id={:?}, name={:?}", i, container.id, container.names);
+        info!("Checking container {}: id={:?}, name={:?}", i, container.id, container.names);
 
         if let Some(network_settings) = &container.network_settings {
             if let Some(networks) = &network_settings.networks {
-                log::info!("Container has {} networks", networks.len());
+                info!("Container has {} networks", networks.len());
                 for (net_name, net) in networks {
-                    log::info!("Checking network '{}' with IP: {:?}", net_name, net.ip_address);
+                    debug!("Checking network '{}' with IP: {:?}", net_name, net.ip_address);
 
                     // If a specific network is requested, only check that network
                     if let Some(requested_network) = network_name {
                         if requested_network != net_name {
-                            log::info!("Skipping network '{}' (not requested)", net_name);
+                            debug!("Skipping network '{}' (not requested)", net_name);
                             continue;
                         }
                     }
 
                     if let Some(ip_str) = &net.ip_address {
-                        log::info!("Comparing IP {} with target {}", ip_str, client_ip);
+                        info!("Comparing IP {} with target {}", ip_str, client_ip);
                         if let Ok(ip) = ip_str.parse::<IpAddr>() {
                             if ip.to_string() == *client_ip {
-                                log::info!("Found matching container with IP {}: {:?}", client_ip, container.id);
+                                debug!("Found matching container with IP {}: {:?}", client_ip, container.id);
                                 if let Some(container_id) = &container.id {
-                                    log::info!("Getting detailed container info for {}", container_id);
+                                    debug!("Getting detailed container info for {}", container_id);
                                     return get_detailed_container_info(docker_client, container_id, inspect_options).await;
                                 }
                             }
                         } else {
-                            log::info!("Failed to parse IP address: {}", ip_str);
+                            info!("Failed to parse IP address: {}", ip_str);
                         }
                     } else {
-                        log::info!("No IP address found for network '{}'", net_name);
+                        info!("No IP address found for network '{}'", net_name);
                     }
                 }
             } else {
-                log::info!("Container has no networks");
+                info!("Container has no networks");
             }
         } else {
-            log::info!("Container has no network settings");
+            info!("Container has no network settings");
         }
     }
 
-    log::info!("No container found with IP: {}", client_ip);
-    Err(DockerError::ContainerNotFound(client_ip.clone()))
+    info!("No container found with IP: {}", client_ip);
+    Err(DockerError::ContainerNotFound(client_ip.to_string()))
 }
 
 /// Get detailed container information for security validation
@@ -166,12 +171,14 @@ async fn get_detailed_container_info(
 
     let config = container_details.config;
     let labels = config.as_ref()
-        .and_then(|c| c.labels.clone())
+        .and_then(|c| c.labels.as_ref())
+        .map(|l| l.clone())
         .unwrap_or_default();
 
     let image = config
         .as_ref()
-        .and_then(|c| c.image.clone())
+        .and_then(|c| c.image.as_ref())
+        .map(|i| i.clone())
         .unwrap_or_else(|| "unknown".to_string());
     let image_name_no_version = extract_image_name_without_version(&image);
 
@@ -257,94 +264,94 @@ pub async fn perform_comprehensive_validation(
     network_name: &Option<String>,
     validation_options: &crate::server::config::DockerValidationOptions,
 ) -> Result<ContainerInfo, DockerError> {
-    log::info!("Starting comprehensive validation for IP: {}", client_ip);
-    log::info!("Validation options: validate_state={}, validate_network={}, validate_labels={}, validate_registry={}", 
-              validation_options.validate_container_state, 
-              validation_options.validate_network_membership, 
-              validation_options.validate_labels, 
-              validation_options.validate_registry);
+    info!("Starting comprehensive validation for IP: {}", client_ip);
+    info!("Validation options: validate_state={}, validate_network={}, validate_labels={}, validate_registry={}", 
+          validation_options.validate_container_state(), 
+          validation_options.validate_network_membership(), 
+          validation_options.validate_labels(), 
+          validation_options.validate_registry());
 
 
-    let list_options = validation_options.list_options.clone();
-    let inspect_options = validation_options.inspect_options.clone();
+    let list_options = validation_options.list_options().cloned();
+    let inspect_options = validation_options.inspect_options().cloned();
 
-    log::info!("Performing container security validation...");
+    info!("Performing container security validation...");
     let container_info = validate_container_security(docker_client, client_ip, network_name, list_options, inspect_options).await?;
-    log::info!("Container security validation successful: name={}, image={}, state={}", 
-              container_info.name, container_info.image, container_info.state);
+    info!("Container security validation successful: name={}, image={}, state={}", 
+          container_info.name, container_info.image, container_info.state);
 
     // Validate container state if enabled
-    if validation_options.validate_container_state {
-        log::info!("Validating container state: {}", container_info.state);
+    if validation_options.validate_container_state() {
+        info!("Validating container state: {}", container_info.state);
         match validate_container_state(&container_info) {
             Ok(_) => {
-                log::info!("Container state validation passed");
+                info!("Container state validation passed");
                 Ok(())
             }
             Err(e) => {
-                log::info!("Container state validation failed: {:?}", e);
+                info!("Container state validation failed: {:?}", e);
                 Err(e)
             }
         }?;
     } else {
-        log::info!("Container state validation skipped");
+        info!("Container state validation skipped");
     }
 
     // Validate network membership if enabled
-    if validation_options.validate_network_membership {
-        log::info!("Validating network membership. Expected: {:?}, Available: {:?}", 
-                  network_name, container_info.networks.keys().collect::<Vec<_>>());
+    if validation_options.validate_network_membership() {
+        info!("Validating network membership. Expected: {:?}, Available: {:?}", 
+              network_name, container_info.networks.keys().collect::<Vec<_>>());
         match validate_network_membership(&container_info, network_name) {
             Ok(_) => {
-                log::info!("Network membership validation passed");
+                info!("Network membership validation passed");
                 Ok(())
             }
             Err(e) => {
-                log::info!("Network membership validation failed: {:?}", e);
+                info!("Network membership validation failed: {:?}", e);
                 Err(e)
             }
         }?;
     } else {
-        log::info!("Network membership validation skipped");
+        info!("Network membership validation skipped");
     }
 
     // Validate required labels if enabled
-    if validation_options.validate_labels {
-        log::info!("Validating required labels: {:?}", validation_options.required_labels);
-        log::info!("Container labels: {:?}", container_info.labels);
-        match validate_container_labels(&container_info, &validation_options.required_labels) {
+    if validation_options.validate_labels() {
+        info!("Validating required labels: {:?}", validation_options.required_labels());
+        info!("Container labels: {:?}", container_info.labels);
+        match validate_container_labels(&container_info, validation_options.required_labels()) {
             Ok(_) => {
-                log::info!("Container labels validation passed");
+                info!("Container labels validation passed");
                 Ok(())
             }
             Err(e) => {
-                log::info!("Container labels validation failed: {:?}", e);
+                info!("Container labels validation failed: {:?}", e);
                 Err(e)
             }
         }?;
     } else {
-        log::info!("Container labels validation skipped");
+        info!("Container labels validation skipped");
     }
 
     // Validate image source if enabled
-    if validation_options.validate_registry {
-        log::info!("Validating image source. Image: {}, Allowed registries: {:?}", 
-                  container_info.image, validation_options.allowed_registries);
-        match validate_image_source(&container_info, &validation_options.allowed_registries) {
+    if validation_options.validate_registry() {
+        info!("Validating image source. Image: {}, Allowed registries: {:?}", 
+              container_info.image, validation_options.allowed_registries());
+        match validate_image_source(&container_info, validation_options.allowed_registries()) {
             Ok(_) => {
-                log::info!("Image source validation passed");
+                info!("Image source validation passed");
                 Ok(())
             }
             Err(e) => {
-                log::info!("Image source validation failed: {:?}", e);
+                info!("Image source validation failed: {:?}", e);
                 Err(e)
             }
         }?;
     } else {
-        log::info!("Image source validation skipped");
+        info!("Image source validation skipped");
     }
 
-    log::info!("Comprehensive validation completed successfully for container: {}", container_info.name);
+    info!("Comprehensive validation completed successfully for container: {}", container_info.name);
     Ok(container_info)
 }
 
@@ -369,4 +376,183 @@ fn extract_image_name_without_version(image: &str) -> String {
     } else {
         image_without_registry.to_string()
     }
-} 
+}
+
+/// Enhanced client validation with header support for testing mode
+#[allow(dead_code)]
+pub async fn validate_docker_client_for_request(
+    ip_cache: &Arc<RwLock<HashMap<String, ContainerCacheEntry>>>,
+    docker_client: &bollard::Docker,
+    client_ip: &IpAddr,
+    headers: &axum::http::HeaderMap,
+    validation_options: &crate::server::config::DockerValidationOptions,
+) -> Result<ContainerInfo, DockerError> {
+    #[cfg(feature = "insecure_mode")]
+    {
+        let docker_instance_name = headers
+            .get("X-Docker-InstanceName")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("test-instance");
+
+        let docker_image = headers
+            .get("X-Docker-ImageName")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("test-image");
+
+        let docker_state = headers
+            .get("X-Docker-State")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("running");
+
+        let docker_labels = headers.get("X-Docker-Labels")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| {
+                let mut labels = HashMap::new();
+                for pair in s.split(',') {
+                    if let Some((key, value)) = pair.trim().split_once('=') {
+                        labels.insert(key.trim().to_string(), value.trim().to_string());
+                    }
+                }
+                labels
+            })
+            .unwrap_or_else(HashMap::new);
+
+        let docker_networks = headers.get("X-Docker-Networks")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| {
+                let mut labels = HashMap::new();
+                for pair in s.split(',') {
+                    if let Some((key, value)) = pair.trim().split_once('=') {
+                        labels.insert(key.trim().to_string(), value.trim().to_string());
+                    }
+                }
+                labels
+            })
+            .unwrap_or_else(HashMap::new);
+
+
+
+        warn!("LOCAL MODE: Using Docker image name from header: {}", docker_image);
+
+        // Create ContainerInfo from headers
+        let container_info = ContainerInfo {
+            name: docker_instance_name.to_string(),
+            image: docker_image.to_string(),
+            image_name_no_version: docker_image.to_string(),
+            state: docker_state.to_string(),
+            labels: docker_labels,
+            networks: docker_networks,
+        };
+
+        // Apply the same validation logic as secure mode, but using header values
+        info!("Starting comprehensive validation for headers-based container info");
+        
+        // Validate container state if enabled
+        if validation_options.validate_container_state() {
+            info!("Validating container state: {}", container_info.state);
+            validate_container_state(&container_info)?;
+        } else {
+            info!("Container state validation skipped");
+        }
+
+        // Validate network membership if enabled
+        if validation_options.validate_network_membership() {
+            info!("Validating network membership. Networks: {:?}, Expected: {:?}", 
+                  container_info.networks.keys().collect::<Vec<_>>(), validation_options.docker_network_name());
+            let network_name = validation_options.docker_network_name().cloned();
+            validate_network_membership(&container_info, &network_name)?;
+        } else {
+            info!("Network membership validation skipped");
+        }
+
+        // Validate required labels if enabled
+        if validation_options.validate_labels() {
+            info!("Validating required labels: {:?}", validation_options.required_labels());
+            info!("Container labels: {:?}", container_info.labels);
+            validate_container_labels(&container_info, validation_options.required_labels())?;
+        } else {
+            info!("Container labels validation skipped");
+        }
+
+        // Validate image source if enabled
+        if validation_options.validate_registry() {
+            info!("Validating image source. Image: {}, Allowed registries: {:?}", 
+                  container_info.image, validation_options.allowed_registries());
+            validate_image_source(&container_info, validation_options.allowed_registries())?;
+        } else {
+            info!("Image source validation skipped");
+        }
+
+        info!("Comprehensive validation completed successfully for headers-based container: {}", container_info.name);
+        return Ok(container_info);
+    }
+    #[cfg(feature = "secure_mode")]
+    {
+        info!("Starting client validation for IP: {}", client_ip);
+        debug!("Validation options: {:?}", validation_options);
+
+        let now = Utc::now();
+        // Check cache first for performance
+        debug!("Checking IP cache for {}", client_ip);
+
+        let rr = ip_cache.read().await;
+
+        if rr.contains_key(&client_ip.to_string()) {
+            let entry = &rr[&client_ip.to_string()];
+            debug!("Cache hit for IP {}: container={}, expires_at={}", client_ip, entry.container_name, entry.expires_at);
+            if entry.expires_at <= now.timestamp_millis() {
+                debug!("Cache entry expired for IP {}", client_ip);
+                // Cache expired, remove it
+                ip_cache.write().await.remove(&client_ip.to_string());
+            } else {
+                debug!("Cache entry still valid for IP {}", client_ip);
+                // Cache hit, but we still need to perform validation
+                // For now, we'll proceed with full validation for security
+            }
+        } else {
+            debug!("No cache entry found for IP {}", client_ip);
+        }
+
+        let docker_timeout = std::time::Duration::from_secs(validation_options.timeout_seconds());
+        debug!("Docker timeout set to {:?}", docker_timeout);
+        // Use comprehensive validation with configurable options
+        info!("Starting comprehensive Docker validation...");
+
+        // Convert Option<&String> to &Option<String> for network_name
+        let network_name = validation_options.docker_network_name().cloned();
+        let result = tokio::time::timeout(
+            docker_timeout,
+            perform_comprehensive_validation(
+                docker_client,
+                &client_ip.to_string(),
+                &network_name,
+                validation_options,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            warn!("Docker validation timed out after {:?}", docker_timeout);
+            DockerError::Timeout("Docker validation timed out".to_string())
+        })?
+        .map_err(|e| {
+            error!("Docker validation failed: {:?}", e);
+            e
+        })?;
+
+        info!("Docker validation successful: container={}, image={}", result.name, result.image);
+        // Cache the result for future requests
+        let cache_entry = ContainerCacheEntry {
+            container_name: result.name.to_string(),
+            expires_at: chrono::Utc::now().timestamp() + 300, // 5 minutes cache
+        };
+        ip_cache.write().await.insert(client_ip.to_string(), cache_entry);
+
+        info!("Client validation completed successfully for IP: {}", client_ip);
+        Ok(result)
+    }
+
+    #[cfg(not(any(feature = "secure_mode", feature = "insecure_mode")))]
+    {
+        panic!("Code must be built with either secure or insecure mode.")
+    }
+}

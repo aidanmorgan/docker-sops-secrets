@@ -212,12 +212,12 @@ async fn get_secrets(
     for secret_name in secret_names {
         match get_secret(client, server_url, secret_name, secrets_working_dir, timeout_duration).await {
             Ok(value) => {
-                secrets.insert(secret_name.clone(), value);
+                secrets.insert(secret_name.to_string(), value);
                 eprintln!("✅ Retrieved secret: {}", secret_name);
             }
             Err(e) => {
                 eprintln!("❌ Failed to retrieve secret '{}': {}", secret_name, e);
-                failed_secrets.push(secret_name.clone());
+                failed_secrets.push(secret_name.to_string());
                 // Continue with other secrets instead of failing completely
             }
         }
@@ -252,7 +252,7 @@ fn write_secrets_to_directory_and_zeroize(
         fs::write(&file_path, secret_value)
             .map_err(|e| ExporterError::Io(e))?;
 
-        files_written.push(secret_name.clone());
+        files_written.push(secret_name.to_string());
     }
 
     // Zeroize all secrets in the HashMap immediately after writing files

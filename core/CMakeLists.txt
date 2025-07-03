@@ -19,10 +19,11 @@ set(BUILD_DIR "${CMAKE_BINARY_DIR}")
 file(MAKE_DIRECTORY ${INTEGRATION_TEST_RESULTS_DIR})
 
 # Define binary output paths
-set(LOCAL_BINARY_PATH "${CMAKE_SOURCE_DIR}/target/release/sops-secrets-server-local")
-set(SECURE_BINARY_PATH "${CMAKE_SOURCE_DIR}/target/release/sops-secrets-server")
-set(CLI_BINARY_PATH "${CMAKE_SOURCE_DIR}/target/release/sops-secrets-cli")
-set(EXPORTER_BINARY_PATH "${CMAKE_SOURCE_DIR}/target/release/sops-secrets-exporter")
+set(LOCAL_SERVER_BINARY_PATH "${CMAKE_SOURCE_DIR}/target/debug/sops-secrets-server-local")
+set(SECURE_SERVER_BINARY_PATH "${CMAKE_SOURCE_DIR}/target/release/sops-secrets-server")
+set(LOCAL_CLI_BINARY_PATH "${CMAKE_SOURCE_DIR}/target/debug/sops-secrets-cli-local")
+set(SECURE_CLI_BINARY_PATH "${CMAKE_SOURCE_DIR}/target/release/sops-secrets-cli")
+set(EXPORTER_BINARY_PATH "${CMAKE_SOURCE_DIR}/target/debug/sops-secrets-exporter")
 
 # Find all Rust source files for dependency tracking to try and improve time to run integration tests
 file(GLOB_RECURSE RUST_SOURCES 
@@ -31,11 +32,11 @@ file(GLOB_RECURSE RUST_SOURCES
     "${CMAKE_SOURCE_DIR}/Cargo.lock"
 )
 
-# Build local binary for testing with proper dependencies
+# Build local server binary for testing with proper dependencies
 add_custom_command(
-    OUTPUT ${LOCAL_BINARY_PATH}
+    OUTPUT ${LOCAL_SERVER_BINARY_PATH}
     COMMAND ${CMAKE_COMMAND} -E echo "🔨 Building local server binary..."
-    COMMAND cargo build --release --features insecure_mode
+    COMMAND cargo build --features insecure_mode --bin sops-secrets-server-local
     COMMAND ${CMAKE_COMMAND} -E echo "Local server binary built successfully"
     DEPENDS ${RUST_SOURCES}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -43,35 +44,35 @@ add_custom_command(
     VERBATIM
 )
 
-# Build CLI binary for testing with proper dependencies
+# Build local binary for CLI with fill debug logging enabled
 add_custom_command(
-    OUTPUT ${CLI_BINARY_PATH}
-    COMMAND ${CMAKE_COMMAND} -E echo "🔨 Building CLI binary..."
-    COMMAND cargo build --release --bin sops-secrets-cli
-    COMMAND ${CMAKE_COMMAND} -E echo "CLI binary built successfully"
+    OUTPUT ${LOCAL_CLI_BINARY_PATH}
+    COMMAND ${CMAKE_COMMAND} -E echo "🔨 Building local CLI binary..."
+    COMMAND cargo build --features insecure_mode --bin sops-secrets-cli-local
+    COMMAND ${CMAKE_COMMAND} -E echo "Local CLI binary built successfully"
     DEPENDS ${RUST_SOURCES}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMENT "Building CLI binary for testing"
+    COMMENT "Building local CLI binary for testing"
     VERBATIM
 )
 
-# Build exporter binary for testing with proper dependencies
+# Build secure CLI binary for testing with proper dependencies
 add_custom_command(
-    OUTPUT ${EXPORTER_BINARY_PATH}
-    COMMAND ${CMAKE_COMMAND} -E echo "🔨 Building exporter binary..."
-    COMMAND cargo build --release --bin sops-secrets-exporter
-    COMMAND ${CMAKE_COMMAND} -E echo "Exporter binary built successfully"
+    OUTPUT ${SECURE_CLI_BINARY_PATH}
+    COMMAND ${CMAKE_COMMAND} -E echo "🔒 Building secure CLI binary..."
+    COMMAND cargo build --release --features secure_mode --bin sops-secrets-cli
+    COMMAND ${CMAKE_COMMAND} -E echo "Secure CLI binary built successfully"
     DEPENDS ${RUST_SOURCES}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMENT "Building exporter binary for testing"
+    COMMENT "Building secure CLI binary for testing"
     VERBATIM
 )
 
 # Build secure server binary (no insecure_mode feature)
 add_custom_command(
-    OUTPUT ${SECURE_BINARY_PATH}
+    OUTPUT ${SECURE_SERVER_BINARY_PATH}
     COMMAND ${CMAKE_COMMAND} -E echo "🔒 Building secure server binary..."
-    COMMAND cargo build --release --bin sops-secrets-server --target-dir target && cp target/release/sops-secrets-server ${SECURE_BINARY_PATH}
+    COMMAND cargo build --release --features secure_mode --bin sops-secrets-server --target-dir target && cp target/release/sops-secrets-server ${SECURE_SERVER_BINARY_PATH}
     COMMAND ${CMAKE_COMMAND} -E echo "Secure server binary built successfully"
     DEPENDS ${RUST_SOURCES}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -79,11 +80,28 @@ add_custom_command(
     VERBATIM
 )
 
+# Build exporter binary for testing with proper dependencies
+add_custom_command(
+    OUTPUT ${EXPORTER_BINARY_PATH}
+    COMMAND ${CMAKE_COMMAND} -E echo "🔨 Building exporter binary..."
+    COMMAND cargo build --bin sops-secrets-exporter
+    COMMAND ${CMAKE_COMMAND} -E echo "Exporter binary built successfully"
+    DEPENDS ${RUST_SOURCES}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Building exporter binary for testing"
+    VERBATIM
+)
+
 # Create targets that depend on the custom commands
-add_custom_target(build-local-binary DEPENDS ${LOCAL_BINARY_PATH})
-add_custom_target(build-cli-binary DEPENDS ${CLI_BINARY_PATH})
+add_custom_target(build-local-server-binary DEPENDS ${LOCAL_SERVER_BINARY_PATH})
+add_custom_target(build-local-cli-binary DEPENDS ${LOCAL_CLI_BINARY_PATH})
+add_custom_target(build-secure-server-binary DEPENDS ${SECURE_SERVER_BINARY_PATH})
+add_custom_target(build-secure-cli-binary DEPENDS ${SECURE_CLI_BINARY_PATH})
 add_custom_target(build-exporter-binary DEPENDS ${EXPORTER_BINARY_PATH})
-add_custom_target(build-secure-binary DEPENDS ${SECURE_BINARY_PATH})
+
+# Grouped build targets
+add_custom_target(build-secure DEPENDS build-secure-server-binary build-secure-cli-binary build-exporter-binary)
+add_custom_target(build-local DEPENDS build-local-server-binary build-local-cli-binary build-exporter-binary)
 
 # Integration test targets (local binary-based)
 if(RUN_INTEGRATION_TESTS)
@@ -106,7 +124,7 @@ if(RUN_INTEGRATION_TESTS)
         COMMENT "Running integration tests"
         VERBATIM
     )
-    
+
     # Run integration tests with detailed output
     add_custom_target(integration-tests-verbose
         COMMAND ${CMAKE_COMMAND} -E echo "🚀 Starting integration tests (verbose mode)..."
@@ -126,7 +144,7 @@ if(RUN_INTEGRATION_TESTS)
         COMMENT "Running integration tests with detailed output"
         VERBATIM
     )
-    
+
     # Clean integration test environment
     add_custom_target(integration-tests-clean
         COMMAND ${CMAKE_COMMAND} -E echo "🧹 Cleaning integration test environment..."
@@ -138,7 +156,7 @@ if(RUN_INTEGRATION_TESTS)
         COMMENT "Cleaning integration test environment"
         VERBATIM
     )
-    
+
     # Show integration test results
     add_custom_target(integration-tests-results
         COMMAND ${CMAKE_COMMAND} -E echo "📊 Integration Test Results"
@@ -152,10 +170,10 @@ if(RUN_INTEGRATION_TESTS)
         COMMENT "Showing integration test results"
         VERBATIM
     )
-    
+
     # Set dependencies
-    add_dependencies(integration-tests build-local-binary)
-    add_dependencies(integration-tests-verbose build-local-binary)
+    add_dependencies(integration-tests build-local)
+    add_dependencies(integration-tests-verbose build-local)
     add_dependencies(integration-tests-results integration-tests)
 endif()
 
@@ -167,9 +185,10 @@ message(STATUS "  Test results directory: ${INTEGRATION_TEST_RESULTS_DIR}")
 # Available targets summary
 message(STATUS "")
 message(STATUS "Available targets:")
-message(STATUS "  build-local-binary          - Build local server binary")
+message(STATUS "  build-local-server-binary          - Build local server binary")
 message(STATUS "  build-secure-binary         - Build secure server binary")
-message(STATUS "  build-cli-binary            - Build CLI binary for testing")
+message(STATUS "  build-local-cli-binary      - Build local CLI binary for testing")
+message(STATUS "  build-secure-cli-binary     - Build secure CLI binary for testing")
 message(STATUS "  build-exporter-binary       - Build exporter binary for testing")
 
 if(RUN_INTEGRATION_TESTS)
@@ -180,5 +199,3 @@ if(RUN_INTEGRATION_TESTS)
     message(STATUS "  integration-tests-clean         - Clean integration test environment")
     message(STATUS "  integration-tests-results       - Show integration test results")
 endif()
-
- 

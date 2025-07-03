@@ -1,5 +1,5 @@
 pub mod rate_limiter;
-pub mod secure_secret;
+
 pub mod errors;
 pub mod config;
 pub mod state;
@@ -19,7 +19,7 @@ pub use self::handlers::*;
 pub use self::health::*;
 pub use self::models::*;
 pub use self::rate_limiter::*;
-pub use self::secure_secret::*;
+
 pub use self::server::{create_server, start_server};
 pub use self::state::*;
 pub use self::utils::*;

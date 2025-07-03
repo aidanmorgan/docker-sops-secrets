@@ -20,6 +20,7 @@ from sops_client import (
     SopsClientError,
     SopsClientConnectionError,
     SopsClientSecretError,
+    SopsClientAuthError,
     health_check,
     get_secret,
     set_secret,
@@ -168,7 +169,7 @@ class TestSecretOwnershipAndPermissions:
         
         # Try to access as unauthorized client
         async with integration_helper.server_helper.with_client_name(unauthorized_name) as unauthorized_client:
-            with pytest.raises(SopsClientSecretError):
+            with pytest.raises(SopsClientAuthError):
                 await unauthorized_client.get_secret(secret_name)
     
     @pytest.mark.asyncio
@@ -313,7 +314,9 @@ class TestSecretOperations:
             integration_helper.server_helper.server_url, 
             secret_name, 
             secret_value, 
-            str(integration_helper.test_dir), 
+            str(integration_helper.test_dir / "secrets"), 
+            "/usr/local/bin/age-keygen",
+            "/usr/local/bin/age",
             client_name
         )
         assert result == "created"
@@ -322,7 +325,9 @@ class TestSecretOperations:
         retrieved_value = await get_secret(
             integration_helper.server_helper.server_url, 
             secret_name, 
-            str(integration_helper.test_dir), 
+            str(integration_helper.test_dir / "secrets"), 
+            "/usr/local/bin/age-keygen",
+            "/usr/local/bin/age",
             client_name
         )
         assert retrieved_value == secret_value
@@ -352,37 +357,54 @@ class TestErrorHandling:
         secret_name = f"empty_secret_{int(time.time())}"
         
         async with integration_helper.server_helper.with_client_name(client_name) as client:
-            # This should work (empty secrets are valid)
-            result = await client.create_secret(secret_name, "")
-            assert result == "created"
-            
-            retrieved_value = await client.get_secret(secret_name)
-            assert retrieved_value == ""
+            # This should fail (empty secrets are not valid)
+            with pytest.raises(SopsClientError):
+                await client.create_secret(secret_name, "")
     
     @pytest.mark.asyncio
     async def test_update_nonexistent_secret(self, integration_helper):
-        """Test updating a secret that doesn't exist."""
-        client_name = f"test-service-{int(time.time())}"
-        secret_name = f"nonexistent_update_{int(time.time())}"
-        new_value = f"new_value_{int(time.time())}"
-        
+        """Test that updating a nonexistent secret creates it (upsert behavior)."""
+        client_name = f"service-upserter-{int(time.time())}"
+        secret_name = f"upsert_secret_{int(time.time())}"
+        secret_value = f"upsert_value_{int(time.time())}"
         async with integration_helper.server_helper.with_client_name(client_name) as client:
-            # This should fail since the secret doesn't exist
-            with pytest.raises(SopsClientSecretError):
-                await client.update_secret(secret_name, new_value)
-    
+            # Should create the secret (upsert)
+            result = await client.update_secret(secret_name, secret_value)
+            assert result == "created"
+            # Should be able to read it back
+            retrieved_value = await client.get_secret(secret_name)
+            assert retrieved_value == secret_value
+
     @pytest.mark.asyncio
     async def test_create_duplicate_secret(self, integration_helper):
-        """Test creating a secret that already exists."""
-        client_name = f"test-service-{int(time.time())}"
-        secret_name = f"duplicate_secret_{int(time.time())}"
-        secret_value = f"secret_value_{int(time.time())}"
-        
+        """Test that creating a duplicate secret updates it (upsert behavior)."""
+        client_name = f"service-upserter-{int(time.time())}"
+        secret_name = f"upsert_secret_{int(time.time())}"
+        secret_value1 = f"upsert_value1_{int(time.time())}"
+        secret_value2 = f"upsert_value2_{int(time.time())}"
         async with integration_helper.server_helper.with_client_name(client_name) as client:
-            # Create the secret first
-            result = await client.create_secret(secret_name, secret_value)
+            # Create the secret
+            result = await client.create_secret(secret_name, secret_value1)
             assert result == "created"
-            
-            # Try to create it again
-            with pytest.raises(SopsClientSecretError):
-                await client.create_secret(secret_name, "different_value") 
+            # Create again (should update)
+            result = await client.create_secret(secret_name, secret_value2)
+            assert result == "updated"
+            # Should be able to read the updated value
+            retrieved_value = await client.get_secret(secret_name)
+            assert retrieved_value == secret_value2
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_access_denied_with_error_check(self, integration_helper):
+        """Test that unauthorized clients cannot access secrets with specific error checking."""
+        owner_name = f"service-owner-{int(time.time())}"
+        unauthorized_name = f"unauthorized-service-{int(time.time())}"
+        secret_name = f"protected_secret_{int(time.time())}"
+        secret_value = f"protected_value_{int(time.time())}"
+        # Create secret as owner
+        async with integration_helper.server_helper.with_client_name(owner_name) as owner_client:
+            result = await owner_client.create_secret(secret_name, secret_value)
+            assert result == "created"
+        # Try to access as unauthorized client
+        async with integration_helper.server_helper.with_client_name(unauthorized_name) as unauthorized_client:
+            with pytest.raises(SopsClientAuthError):
+                await unauthorized_client.get_secret(secret_name) 

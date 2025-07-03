@@ -8,16 +8,19 @@ use crate::server::docker::ContainerCache;
 use crate::server::file_cleaner::FileCleanupManager;
 use crate::server::models::WriteOperation;
 use crate::server::rate_limiter::RateLimiter;
-use crate::shared::sops::SopsWrapper;
+use crate::sops::SopsWrapper;
 
 /// Application state shared across all request handlers
 pub struct AppState {
     /// SOPS client for secret operations. Thread-safe due to immutable design.
-    pub sops_client: SopsWrapper,
+    /// Wrapped in Arc to avoid unnecessary cloning.
+    pub sops_client: Arc<SopsWrapper>,
     /// Docker client for container operations. Thread-safe by design.
-    pub docker_client: Docker,
+    /// Wrapped in Arc to avoid unnecessary cloning.
+    pub docker_client: Arc<Docker>,
     /// Server configuration. Thread-safe due to read-only, owned types.
-    pub server_config: ServerConfig,
+    /// Wrapped in Arc to avoid unnecessary cloning.
+    pub server_config: Arc<ServerConfig>,
     /// Cache for IP to container mapping to avoid repeated Docker API calls.
     /// Thread-safe through `Arc<RwLock<...>>` - multiple readers, exclusive writers.
     pub ip_cache: ContainerCache,
@@ -30,4 +33,4 @@ pub struct AppState {
     /// Rate limiter for preventing DoS attacks.
     /// Thread-safe through `Arc<RwLock<...>>`.
     pub rate_limiter: Arc<RateLimiter>,
-} 
+}
